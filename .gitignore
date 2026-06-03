@@ -6,3 +6,5 @@
 *.fcs
 *.fm2
 fceux.cfg
+# ハードウェア不安定問題の調査メモ (NES開発とは無関係)
+hardware_issue.md
