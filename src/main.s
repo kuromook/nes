@@ -30,7 +30,11 @@ BTN_RIGHT  = %00000001
 ; ---- 移動パラメータ ----
 SPEED = 2
 X_MAX = 248        ; 画面右端 (256 - 8px)
-Y_MAX = 224        ; 下方向の上限
+
+; ---- 物理 (ジャンプ / 重力) ----
+GRAVITY  = 40      ; 重力加速度 (1/256 px/frame^2)
+JUMP_VEL = $FC00   ; ジャンプ初速 = -4.0 px/frame (8.8 符号付き)
+FLOOR_Y  = 208     ; 地面の上に立つ Y (地面 row27=y216, スプライト8px)
 
 ; ---- 背景タイル / ステージ ----
 TILE_SKY    = 0    ; 空 (空白タイル)
@@ -43,10 +47,15 @@ OAM = $0200        ; OAM バッファ (1ページ = スプライト64個分)
 ; 変数 (ゼロページ)
 ; -------------------------------------------------------------
 .segment "ZEROPAGE"
-pad1:     .res 1   ; ボタン状態
-player_x: .res 1   ; キャラ X 座標
-player_y: .res 1   ; キャラ Y 座標
-bg_tile:  .res 1   ; 背景描画ループの一時タイル番号
+pad1:      .res 1   ; ボタン状態
+player_x:  .res 1   ; キャラ X 座標
+player_y:  .res 1   ; キャラ Y 座標 (整数部 / OAM へ渡す)
+py_sub:    .res 1   ; Y 座標の小数部 (8.8 固定小数の下位)
+vy_lo:     .res 1   ; Y 速度 小数部 (8.8 符号付き)
+vy_hi:     .res 1   ; Y 速度 整数部
+on_ground: .res 1   ; 接地フラグ (1 = 地面の上)
+pad1_prev: .res 1   ; 前フレームのボタン状態 (エッジ検出用)
+bg_tile:   .res 1   ; 背景描画ループの一時タイル番号
 
 ; -------------------------------------------------------------
 ; iNES ヘッダ
@@ -117,11 +126,17 @@ load_palette:
 
     jsr draw_background   ; ネームテーブルにステージを描く (描画OFF中)
 
-    ; キャラ初期位置 (画面中央付近)
+    ; キャラ初期位置 (画面中央付近・空中スタート → 重力で着地)
     lda #120
     sta player_x
     lda #112
     sta player_y
+    lda #0
+    sta py_sub
+    sta vy_lo
+    sta vy_hi
+    sta on_ground
+    sta pad1_prev
 
     lda #$00           ; スクロール初期化
     sta PPUADDR
@@ -207,30 +222,60 @@ forever:
     sta player_x
 @no_right:
 
-    ; --- 上 ---
-    lda pad1
-    and #BTN_UP
-    beq @no_up
-    lda player_y
-    cmp #SPEED
-    bcc @no_up
-    sec
-    sbc #SPEED
-    sta player_y
-@no_up:
+    ; --- ジャンプ (A を押した瞬間 & 接地時のみ) ---
+    lda pad1_prev
+    eor #$ff
+    and pad1            ; このフレーム新たに押されたボタン
+    and #BTN_A
+    beq @no_jump
+    lda on_ground
+    beq @no_jump
+    lda #<JUMP_VEL      ; 上向き初速をセット
+    sta vy_lo
+    lda #>JUMP_VEL
+    sta vy_hi
+    lda #0
+    sta on_ground
+@no_jump:
 
-    ; --- 下 ---
-    lda pad1
-    and #BTN_DOWN
-    beq @no_down
-    lda player_y
-    cmp #Y_MAX
-    bcs @no_down
+    ; --- 重力: vy += GRAVITY ---
     clc
-    adc #SPEED
-    sta player_y
-@no_down:
+    lda vy_lo
+    adc #<GRAVITY
+    sta vy_lo
+    lda vy_hi
+    adc #>GRAVITY
+    sta vy_hi
 
+    ; --- 位置更新: (player_y.py_sub) += vy  (8.8 符号付き加算) ---
+    clc
+    lda py_sub
+    adc vy_lo
+    sta py_sub
+    lda player_y
+    adc vy_hi
+    sta player_y
+
+    ; --- 地面との当たり判定 ---
+    lda player_y
+    cmp #FLOOR_Y
+    bcc @airborne      ; player_y < FLOOR_Y → 空中
+    lda #FLOOR_Y       ; 着地: 床にスナップして停止
+    sta player_y
+    lda #0
+    sta py_sub
+    sta vy_lo
+    sta vy_hi
+    lda #1
+    sta on_ground
+    jmp @save_pad
+@airborne:
+    lda #0
+    sta on_ground
+
+@save_pad:
+    lda pad1           ; 次フレームのエッジ検出用に保存
+    sta pad1_prev
     rts
 .endproc
 
