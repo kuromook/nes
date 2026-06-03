@@ -27,9 +27,13 @@ BTN_DOWN   = %00000100
 BTN_LEFT   = %00000010
 BTN_RIGHT  = %00000001
 
-; ---- 移動パラメータ ----
-SPEED = 2
-X_MAX = 248        ; 画面右端 (256 - 8px)
+; ---- 移動パラメータ / ワールド ----
+SPEED      = 2
+WORLD_W    = 512   ; ワールド幅 = 2画面 (ネームテーブル2枚)
+WORLD_MAX  = 504   ; キャラ X の右端 (512 - 8px)
+SCREEN_W   = 256   ; 画面幅
+CAM_OFFSET = 120   ; カメラがキャラを置く画面内X (中央付近)
+CAM_MAX    = WORLD_W - SCREEN_W  ; カメラXの上限 = 256
 
 ; ---- 物理 (ジャンプ / 重力) ----
 GRAVITY  = 40      ; 重力加速度 (1/256 px/frame^2)
@@ -37,7 +41,7 @@ JUMP_VEL = $FC00   ; ジャンプ初速 = -4.0 px/frame (8.8 符号付き)
 FLOOR_Y  = 208     ; 地面の上に立つ Y (地面 row27=y216, スプライト8px)
 
 ; ---- 足場 (プラットフォーム) ----
-NUM_PLATFORMS = 3  ; 足場の枚数 (plat_top/x0/x1 テーブルと一致させる)
+NUM_PLATFORMS = 6  ; 足場の枚数 (plat_* テーブルと一致させる)
 
 ; ---- 背景タイル / ステージ ----
 TILE_SKY    = 0    ; 空 (空白タイル)
@@ -57,7 +61,8 @@ OAM = $0200        ; OAM バッファ (1ページ = スプライト64個分)
 ; -------------------------------------------------------------
 .segment "ZEROPAGE"
 pad1:      .res 1   ; ボタン状態
-player_x:  .res 1   ; キャラ X 座標
+px_lo:     .res 1   ; キャラ X ワールド座標 下位 (0..504)
+px_hi:     .res 1   ; キャラ X ワールド座標 上位 (0 or 1)
 player_y:  .res 1   ; キャラ Y 座標 (整数部 / OAM へ渡す)
 py_sub:    .res 1   ; Y 座標の小数部 (8.8 固定小数の下位)
 vy_lo:     .res 1   ; Y 速度 小数部 (8.8 符号付き)
@@ -68,8 +73,11 @@ facing_attr:.res 1  ; キャラの向き = OAM 属性 (0=右 / $40=左反転)
 anim_timer:.res 1   ; 歩行アニメ用フレームカウンタ
 moving:    .res 1   ; このフレームに横入力があったか (1=歩行中)
 prev_y:    .res 1   ; 更新前の Y (足場の通過判定に使う)
+camera_lo: .res 1   ; カメラ X 下位 (スクロール量 0..256)
+camera_hi: .res 1   ; カメラ X 上位 (0 or 1 = ネームテーブル選択)
+screen_x:  .res 1   ; キャラの画面内X (= px - camera, OAM へ渡す)
 bg_tile:   .res 1   ; 背景描画ループの一時タイル番号
-ptr_lo:    .res 1   ; 汎用ポインタ下位 (足場描画でPPUADDR計算に使用)
+ptr_lo:    .res 1   ; 汎用ポインタ下位 (描画/当たり判定の一時計算用)
 ptr_hi:    .res 1   ; 汎用ポインタ上位
 
 ; -------------------------------------------------------------
@@ -79,7 +87,7 @@ ptr_hi:    .res 1   ; 汎用ポインタ上位
     .byte "NES", $1A
     .byte 2            ; PRG 32KB
     .byte 1            ; CHR 8KB
-    .byte $00          ; mapper 0
+    .byte $01          ; flags6: mapper0 / bit0=1 垂直ミラー (水平スクロール用)
     .byte $00
     .byte $00,$00,$00,$00,$00,$00,$00,$00
 
@@ -141,9 +149,11 @@ load_palette:
 
     jsr draw_background   ; ネームテーブルにステージを描く (描画OFF中)
 
-    ; キャラ初期位置 (画面中央付近・空中スタート → 重力で着地)
+    ; キャラ初期位置 (ワールドX=120・空中スタート → 重力で着地)
     lda #120
-    sta player_x
+    sta px_lo
+    lda #0
+    sta px_hi
     lda #112
     sta player_y
     lda #0
@@ -178,12 +188,13 @@ forever:
 
     jsr read_controller
     jsr move_player
+    jsr update_camera  ; camera_lo/hi と screen_x を計算
 
     ; スプライト0 (キャラ) を OAM バッファへ書き込み
     lda player_y
     sta OAM+0          ; Y 座標
-    lda player_x
-    sta OAM+3          ; X 座標
+    lda screen_x
+    sta OAM+3          ; 画面内X 座標
     jsr animate        ; OAM+1(タイル) と OAM+2(属性=向き) をセット
 
     ; OAM DMA: $0200-$02FF を PPU の OAM へ一括転送
@@ -192,11 +203,15 @@ forever:
     lda #>OAM          ; = $02
     sta OAMDMA
 
-    ; スクロールを 0 に戻す
-    bit PPUSTATUS
+    ; スクロール設定: カメラXを反映 (PPUCTRL のネームテーブルbit + PPUSCROLL)
+    bit PPUSTATUS      ; 書き込みトグル(w)をリセット
+    lda #%10000000     ; NMI有効 / パターン$0000
+    ora camera_hi      ; bit0 = ネームテーブルX (camera_hi が 1 で右画面)
+    sta PPUCTRL
+    lda camera_lo
+    sta PPUSCROLL      ; X スクロール
     lda #$00
-    sta PPUSCROLL
-    sta PPUSCROLL
+    sta PPUSCROLL      ; Y スクロール = 0
 
     pla
     tay
@@ -207,13 +222,13 @@ forever:
 .endproc
 
 ; -------------------------------------------------------------
-; 十字キーで player_x / player_y を更新 (画面端でクランプ)
+; 十字キーで横移動(px 16bit) / ジャンプ・重力で縦移動 / 足場・地面の当たり判定
 ; -------------------------------------------------------------
 .proc move_player
     lda #0
     sta moving         ; 横入力フラグをクリア
 
-    ; --- 左 ---
+    ; --- 左 (px -= SPEED, 0 でクランプ) ---
     lda pad1
     and #BTN_LEFT
     beq @no_left
@@ -221,15 +236,20 @@ forever:
     sta facing_attr
     lda #1
     sta moving
-    lda player_x
-    cmp #SPEED
-    bcc @no_left       ; 左端なら動かさない (向き/歩行は維持)
     sec
+    lda px_lo
     sbc #SPEED
-    sta player_x
+    sta px_lo
+    lda px_hi
+    sbc #0
+    sta px_hi
+    bcs @no_left       ; 借りなし → 0以上、OK
+    lda #0             ; アンダーフロー → 0 にクランプ
+    sta px_lo
+    sta px_hi
 @no_left:
 
-    ; --- 右 ---
+    ; --- 右 (px += SPEED, WORLD_MAX でクランプ) ---
     lda pad1
     and #BTN_RIGHT
     beq @no_right
@@ -237,12 +257,27 @@ forever:
     sta facing_attr
     lda #1
     sta moving
-    lda player_x
-    cmp #X_MAX
-    bcs @no_right      ; 右端なら動かさない
     clc
+    lda px_lo
     adc #SPEED
-    sta player_x
+    sta px_lo
+    lda px_hi
+    adc #0
+    sta px_hi
+    ; px > WORLD_MAX ならクランプ
+    lda px_hi
+    cmp #>WORLD_MAX
+    bcc @no_right      ; hi < 1 → 範囲内
+    bne @clamp_r       ; hi > 1 → クランプ
+    lda px_lo
+    cmp #<WORLD_MAX
+    bcc @no_right      ; lo < 248 → 範囲内
+    beq @no_right      ; == ちょうど右端 → OK
+@clamp_r:
+    lda #<WORLD_MAX
+    sta px_lo
+    lda #>WORLD_MAX
+    sta px_hi
 @no_right:
 
     ; --- ジャンプ (A を押した瞬間 & 接地時のみ) ---
@@ -286,15 +321,32 @@ forever:
     bmi @after_plat    ; vy<0 (上昇中) は足場を通り抜ける
     ldy #NUM_PLATFORMS-1
 @ploop:
-    ; X 重なり: player_x < x1 かつ player_x+7 >= x0
-    lda player_x
-    cmp plat_x1,y
-    bcs @pnext         ; player_x >= x1 → 横が重ならない
-    lda player_x
+    ; X 重なり (16bit): px < x1 かつ px+7 >= x0
+    ; --- px < x1 ? (px >= x1 なら重ならない) ---
+    lda px_hi
+    cmp plat_x1_hi,y
+    bcc @xok1          ; px_hi < x1_hi → px < x1
+    bne @pnext         ; px_hi > x1_hi → px >= x1
+    lda px_lo
+    cmp plat_x1_lo,y
+    bcs @pnext         ; px_lo >= x1_lo → px >= x1
+@xok1:
+    ; --- px+7 >= x0 ? (px+7 < x0 なら重ならない) ---
     clc
+    lda px_lo
     adc #7
-    cmp plat_x0,y
-    bcc @pnext         ; player_x+7 < x0 → 横が重ならない
+    sta ptr_lo
+    lda px_hi
+    adc #0
+    sta ptr_hi         ; ptr = px+7 (16bit)
+    lda ptr_hi
+    cmp plat_x0_hi,y
+    bcc @pnext         ; (px+7)_hi < x0_hi → px+7 < x0
+    bne @xok2          ; (px+7)_hi > x0_hi → px+7 > x0
+    lda ptr_lo
+    cmp plat_x0_lo,y
+    bcc @pnext         ; (px+7)_lo < x0_lo → px+7 < x0
+@xok2:
     ; 縦の通過: prev_feet <= top かつ new_feet >= top
     lda prev_y
     clc
@@ -349,6 +401,48 @@ forever:
 .endproc
 
 ; -------------------------------------------------------------
+; カメラ更新: キャラを画面中央付近に置くよう追従
+;   camera = px - CAM_OFFSET、[0, CAM_MAX] にクランプ
+;   screen_x = px - camera (キャラの画面内X)
+; -------------------------------------------------------------
+.proc update_camera
+    ; camera = px - CAM_OFFSET (16bit)
+    sec
+    lda px_lo
+    sbc #CAM_OFFSET
+    sta camera_lo
+    lda px_hi
+    sbc #0
+    sta camera_hi
+    bcs @chk_max       ; 借りなし → 0以上
+    lda #0             ; px < CAM_OFFSET → camera = 0
+    sta camera_lo
+    sta camera_hi
+    jmp @calc_sx
+@chk_max:
+    ; camera > CAM_MAX(256=$0100) ならクランプ
+    lda camera_hi
+    cmp #>CAM_MAX
+    bcc @calc_sx       ; hi < 1 → <256 OK
+    bne @clamp_max     ; hi > 1 → クランプ
+    lda camera_lo
+    beq @calc_sx       ; hi==1 かつ lo==0 → ちょうど256 OK
+@clamp_max:
+    lda #<CAM_MAX
+    sta camera_lo
+    lda #>CAM_MAX
+    sta camera_hi
+
+@calc_sx:
+    ; screen_x = px - camera (結果は 0..255 に収まる → 下位のみ)
+    sec
+    lda px_lo
+    sbc camera_lo
+    sta screen_x
+    rts
+.endproc
+
+; -------------------------------------------------------------
 ; アニメ: キャラのタイル(OAM+1)と向き(OAM+2)を決める
 ;   歩行中(moving=1): anim_timer を進めて A/B を 8フレーム周期で交互
 ;   停止中: フレームAで固定・カウンタリセット
@@ -383,15 +477,23 @@ forever:
 .endproc
 
 ; -------------------------------------------------------------
-; 背景描画: ネームテーブル($2000) にステージを描く
-;   上 27 行 = 空(タイル0) / 下 3 行 = 地面(タイル2)
-;   属性テーブル(64byte) は全て BG パレット0
-;   ※ 描画OFF中に呼ぶこと (960+64 byte の転送に時間がかかる)
+; 背景描画: ネームテーブル2枚 ($2000/$2400) にステージを描く
+;   = 512px幅のワールド。各画面: 上27行=空 / 下3行=地面、属性=全0
+;   ※ 描画OFF中に呼ぶこと
 ; -------------------------------------------------------------
 .proc draw_background
-    bit PPUSTATUS         ; アドレスラッチをリセット
-    lda #$20              ; ネームテーブル0 = $2000
-    sta PPUADDR
+    lda #$20              ; ネームテーブル0 = $2000 (左画面)
+    jsr fill_screen
+    lda #$24              ; ネームテーブル1 = $2400 (右画面)
+    jsr fill_screen
+    jsr draw_platforms    ; 足場を上書き
+    rts
+.endproc
+
+; 1画面ぶん(960+64byte)を塗る。A = ベース上位バイト ($20 or $24)
+.proc fill_screen
+    bit PPUSTATUS         ; アドレスラッチをリセット (A は不変)
+    sta PPUADDR           ; ベース上位
     lda #$00
     sta PPUADDR
 
@@ -415,23 +517,22 @@ forever:
     cpx #30
     bne @row
 
-    ; 属性テーブル ($23C0-$23FF) = 64 byte 全て 0 (全タイルが BG パレット0)
+    ; 属性テーブル 64 byte 全て 0 (全タイルが BG パレット0)
     ldy #64
     lda #$00
 @attr:
     sta PPUDATA
     dey
     bne @attr
-
-    jsr draw_platforms    ; 足場をネームテーブルへ上書き
     rts
 .endproc
 
 ; -------------------------------------------------------------
-; 足場描画: plat_top/x0/x1 の各足場をレンガ(タイル2)で描く
-;   ネームテーブルアドレス = $2000 + top*4 + x0/8
-;     (top=row*8 なので top*4 = row*32 = 行頭オフセット)
-;   タイル数 = (x1 - x0) / 8
+; 足場描画: 各足場をレンガ(タイル2)で描く (2ネームテーブル対応)
+;   各足場は1画面内に収まる前提 (x0_hi == x1_hi)
+;   localcol = x0_lo/8 / ネームテーブルは x0_hi (0=$2000 / 1=$2400)
+;   addr = $2000 + x0_hi*$0400 + top*4 + localcol
+;   タイル数 = (x1_lo - x0_lo)/8
 ; -------------------------------------------------------------
 .proc draw_platforms
     ldy #0
@@ -448,8 +549,8 @@ forever:
     rol ptr_hi
     asl ptr_lo
     rol ptr_hi
-    ; ptr += x0/8
-    lda plat_x0,y
+    ; ptr += localcol (= x0_lo/8)
+    lda plat_x0_lo,y
     lsr a
     lsr a
     lsr a
@@ -459,10 +560,13 @@ forever:
     lda ptr_hi
     adc #0
     sta ptr_hi
-    ; ptr += $2000
-    lda ptr_hi
+    ; ptr_hi += $20 + x0_hi*4  (ネームテーブル選択)
+    lda plat_x0_hi,y
+    asl a
+    asl a
     clc
     adc #$20
+    adc ptr_hi
     sta ptr_hi
 
     ; PPUADDR = ptr
@@ -472,10 +576,10 @@ forever:
     lda ptr_lo
     sta PPUADDR
 
-    ; タイル数 = (x1-x0)/8 → X
-    lda plat_x1,y
+    ; タイル数 = (x1_lo - x0_lo)/8 → X
+    lda plat_x1_lo,y
     sec
-    sbc plat_x0,y
+    sbc plat_x0_lo,y
     lsr a
     lsr a
     lsr a
@@ -524,13 +628,15 @@ palette:
     .byte $0f,$12,$22,$30,  $0f,$14,$24,$30
 
 ; -------------------------------------------------------------
-; 足場テーブル (ピクセル座標 / 描画と当たり判定で共用)
-;   top = 上面Y / x0 = 左端X / x1 = 右端X(排他)。タイル境界(8の倍数)
-;   右上へ向かう階段状の3枚 (row22/18/14, 幅4/5/5 タイル)
+; 足場テーブル (ワールド・ピクセル座標 / 描画と当たり判定で共用)
+;   top=上面Y(8bit) / x0,x1=左右端X(16bit, 排他)。各足場は1画面内に収める
+;   512px幅に6枚配置 (前半3枚=左画面 / 後半3枚=右画面)
 ; -------------------------------------------------------------
-plat_top: .byte 176, 144, 112   ; row 22 / 18 / 14 (*8)
-plat_x0:  .byte  32,  96, 176   ; col 4 / 12 / 22 (*8)
-plat_x1:  .byte  64, 136, 216   ; col 8 / 17 / 27 (*8)
+plat_top:    .byte 176, 144, 112, 144, 112, 160
+plat_x0_lo:  .byte  32,  96, 176,  24, 104, 184
+plat_x0_hi:  .byte   0,   0,   0,   1,   1,   1
+plat_x1_lo:  .byte  64, 136, 216,  64, 144, 224
+plat_x1_hi:  .byte   0,   0,   0,   1,   1,   1
 
 ; -------------------------------------------------------------
 ; 割り込みベクタ
