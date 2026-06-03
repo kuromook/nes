@@ -1,24 +1,44 @@
 ; =============================================================
-; NES Hello World (ca65 / NROM-256, mapper 0)
-;   起動して背景を 1 色で塗りつぶす最小サンプル。
-;   ツールチェーン (ca65/ld65) とエミュレータの動作確認用。
+; NES コントローラ入力デモ (ca65 / NROM-256, mapper 0)
+;   押したボタンで画面全体の背景色が変わる。
+;     ↑=緑 ↓=赤 ←=黄 →=水色 / A=白 B=マゼンタ / 無押下=黒
+;   $4016 から1コントローラ分(8ボタン)を読み取る基本形。
 ; =============================================================
 
-; ---- PPU / APU レジスタ ----
+; ---- PPU / コントローラ レジスタ ----
 PPUCTRL   = $2000
 PPUMASK   = $2001
 PPUSTATUS = $2002
+PPUSCROLL = $2005
 PPUADDR   = $2006
 PPUDATA   = $2007
+JOYPAD1   = $4016
+
+; ---- ボタンビット (pad1 内の並び: A B Sel St U D L R) ----
+BTN_A      = %10000000
+BTN_B      = %01000000
+BTN_SELECT = %00100000
+BTN_START  = %00010000
+BTN_UP     = %00001000
+BTN_DOWN   = %00000100
+BTN_LEFT   = %00000010
+BTN_RIGHT  = %00000001
+
+; -------------------------------------------------------------
+; 変数 (ゼロページ)
+; -------------------------------------------------------------
+.segment "ZEROPAGE"
+pad1:    .res 1         ; 現在のボタン状態
+bgcolor: .res 1         ; 表示する背景色 ($3F00 に書く値)
 
 ; -------------------------------------------------------------
 ; iNES ヘッダ (16 byte)
 ; -------------------------------------------------------------
 .segment "HEADER"
-    .byte "NES", $1A   ; マジックナンバー
+    .byte "NES", $1A
     .byte 2            ; PRG-ROM 2 * 16KB = 32KB
     .byte 1            ; CHR-ROM 1 * 8KB
-    .byte $00          ; flags6  : mapper 0, 横スクロールミラー
+    .byte $00          ; flags6 : mapper 0
     .byte $00          ; flags7
     .byte $00,$00,$00,$00,$00,$00,$00,$00
 
@@ -27,23 +47,21 @@ PPUDATA   = $2007
 ; -------------------------------------------------------------
 .segment "CODE"
 .proc reset
-    sei                ; 割り込み禁止
-    cld                ; 10進モード解除
+    sei
+    cld
     ldx #$40
     stx $4017          ; APU フレーム IRQ 無効
     ldx #$ff
-    txs                ; スタックポインタ初期化
+    txs
     inx                ; X = 0
     stx PPUCTRL        ; NMI 無効
     stx PPUMASK        ; 描画オフ
     stx $4010          ; DMC IRQ 無効
 
-    ; 1回目の vblank を待つ
-:   bit PPUSTATUS
+:   bit PPUSTATUS      ; 1回目の vblank 待ち
     bpl :-
 
-    ; RAM クリア
-    txa
+    txa                ; RAM クリア
 clear_ram:
     sta $0000, x
     sta $0100, x
@@ -56,12 +74,11 @@ clear_ram:
     inx
     bne clear_ram
 
-    ; 2回目の vblank を待つ (PPU 安定化)
-:   bit PPUSTATUS
+:   bit PPUSTATUS      ; 2回目の vblank 待ち
     bpl :-
 
     ; パレット書き込み ($3F00-)
-    bit PPUSTATUS      ; アドレスラッチをリセット
+    bit PPUSTATUS
     lda #$3f
     sta PPUADDR
     lda #$00
@@ -74,40 +91,134 @@ load_palette:
     cpx #32
     bne load_palette
 
-    ; スクロール位置を 0 に
-    lda #$00
+    lda #$0f           ; 背景色の初期値 = 黒
+    sta bgcolor
+
+    lda #$00           ; スクロール初期化
     sta PPUADDR
     sta PPUADDR
 
-    ; 描画オン + NMI 有効
     lda #%10000000     ; NMI 有効
     sta PPUCTRL
     lda #%00001110     ; 背景表示 ON
     sta PPUMASK
 
 forever:
-    jmp forever
+    jmp forever        ; あとは NMI に任せる
 .endproc
 
 ; -------------------------------------------------------------
-; NMI (毎フレーム vblank で発生)
+; NMI (毎フレーム vblank): 入力読取 → 色決定 → 画面反映
 ; -------------------------------------------------------------
 .proc nmi
+    pha
+    txa
+    pha
+    tya
+    pha
+
+    jsr read_controller
+    jsr update_color
+
+    ; 背景色 $3F00 を更新 (vblank 中なので書き込み可)
+    bit PPUSTATUS
+    lda #$3f
+    sta PPUADDR
+    lda #$00
+    sta PPUADDR
+    lda bgcolor
+    sta PPUDATA
+
+    ; VRAM アドレス / スクロールを 0 に戻す
+    lda #$00
+    sta PPUADDR
+    sta PPUADDR
+    sta PPUSCROLL
+    sta PPUSCROLL
+
+    pla
+    tay
+    pla
+    tax
+    pla
     rti
 .endproc
 
 ; -------------------------------------------------------------
+; コントローラ1 を読み取り pad1 に格納
+;   ストローブ後 8 回読むと pad1 = A B Sel St U D L R (bit7..0)
+; -------------------------------------------------------------
+.proc read_controller
+    lda #$01
+    sta JOYPAD1
+    lda #$00
+    sta JOYPAD1        ; 1→0 で状態をラッチ
+    ldx #8
+loop:
+    lda JOYPAD1        ; bit0 にボタン状態 (1=押下)
+    lsr a              ; bit0 → キャリー
+    rol pad1           ; キャリーを pad1 に取り込む
+    dex
+    bne loop
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; pad1 の内容から bgcolor を決定
+;   複数同時押し時は後で評価したボタンが優先される
+; -------------------------------------------------------------
+.proc update_color
+    lda #$0f           ; 既定: 黒
+    sta bgcolor
+
+    lda pad1
+    and #BTN_UP
+    beq :+
+    lda #$2a           ; 緑
+    sta bgcolor
+:
+    lda pad1
+    and #BTN_DOWN
+    beq :+
+    lda #$16           ; 赤
+    sta bgcolor
+:
+    lda pad1
+    and #BTN_LEFT
+    beq :+
+    lda #$28           ; 黄
+    sta bgcolor
+:
+    lda pad1
+    and #BTN_RIGHT
+    beq :+
+    lda #$21           ; 水色
+    sta bgcolor
+:
+    lda pad1
+    and #BTN_B
+    beq :+
+    lda #$14           ; マゼンタ
+    sta bgcolor
+:
+    lda pad1
+    and #BTN_A
+    beq :+
+    lda #$30           ; 白
+    sta bgcolor
+:
+    rts
+.endproc
+
+; -------------------------------------------------------------
 ; パレットデータ
-;   背景色 $21 = 明るい青。確認しやすいよう全体を青系に。
 ; -------------------------------------------------------------
 .segment "RODATA"
 palette:
-    ; 背景パレット
-    .byte $21,$10,$30,$0f,  $21,$06,$16,$0f
-    .byte $21,$09,$19,$0f,  $21,$01,$11,$0f
-    ; スプライトパレット
-    .byte $21,$10,$30,$0f,  $21,$06,$16,$0f
-    .byte $21,$09,$19,$0f,  $21,$01,$11,$0f
+    .byte $0f,$10,$30,$0f,  $0f,$06,$16,$0f
+    .byte $0f,$09,$19,$0f,  $0f,$01,$11,$0f
+    .byte $0f,$10,$30,$0f,  $0f,$06,$16,$0f
+    .byte $0f,$09,$19,$0f,  $0f,$01,$11,$0f
 
 ; -------------------------------------------------------------
 ; 割り込みベクタ
@@ -118,7 +229,7 @@ palette:
     .word 0            ; $FFFE: IRQ/BRK
 
 ; -------------------------------------------------------------
-; CHR-ROM (8KB) — 今は空 (タイルは全て 0)
+; CHR-ROM (8KB) — タイルは未使用 (全0)
 ; -------------------------------------------------------------
 .segment "CHARS"
     .res 8192, $00
