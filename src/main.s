@@ -41,6 +41,12 @@ TILE_SKY    = 0    ; 空 (空白タイル)
 TILE_GROUND = 2    ; 地面 (レンガタイル)
 GROUND_ROW  = 27   ; この行から下を地面にする (27,28,29 の3行)
 
+; ---- キャラのアニメ ----
+TILE_WALK_A = 1          ; 歩行フレームA (デフォルト・停止時もこれ)
+TILE_WALK_B = 3          ; 歩行フレームB (足の位置違い)
+ANIM_MASK   = %00001000  ; このビットで A/B を切替 (= 8フレーム周期)
+ATTR_FLIP   = %01000000  ; OAM 属性: 水平反転 (bit6) = 左向き
+
 OAM = $0200        ; OAM バッファ (1ページ = スプライト64個分)
 
 ; -------------------------------------------------------------
@@ -55,6 +61,9 @@ vy_lo:     .res 1   ; Y 速度 小数部 (8.8 符号付き)
 vy_hi:     .res 1   ; Y 速度 整数部
 on_ground: .res 1   ; 接地フラグ (1 = 地面の上)
 pad1_prev: .res 1   ; 前フレームのボタン状態 (エッジ検出用)
+facing_attr:.res 1  ; キャラの向き = OAM 属性 (0=右 / $40=左反転)
+anim_timer:.res 1   ; 歩行アニメ用フレームカウンタ
+moving:    .res 1   ; このフレームに横入力があったか (1=歩行中)
 bg_tile:   .res 1   ; 背景描画ループの一時タイル番号
 
 ; -------------------------------------------------------------
@@ -167,12 +176,9 @@ forever:
     ; スプライト0 (キャラ) を OAM バッファへ書き込み
     lda player_y
     sta OAM+0          ; Y 座標
-    lda #1
-    sta OAM+1          ; タイル番号 (1 = キャラ絵)
-    lda #0
-    sta OAM+2          ; 属性 (パレット0 / 反転なし)
     lda player_x
     sta OAM+3          ; X 座標
+    jsr animate        ; OAM+1(タイル) と OAM+2(属性=向き) をセット
 
     ; OAM DMA: $0200-$02FF を PPU の OAM へ一括転送
     lda #$00
@@ -198,13 +204,20 @@ forever:
 ; 十字キーで player_x / player_y を更新 (画面端でクランプ)
 ; -------------------------------------------------------------
 .proc move_player
+    lda #0
+    sta moving         ; 横入力フラグをクリア
+
     ; --- 左 ---
     lda pad1
     and #BTN_LEFT
     beq @no_left
+    lda #ATTR_FLIP     ; 左向き (スプライト反転)
+    sta facing_attr
+    lda #1
+    sta moving
     lda player_x
     cmp #SPEED
-    bcc @no_left       ; 左端なら動かさない
+    bcc @no_left       ; 左端なら動かさない (向き/歩行は維持)
     sec
     sbc #SPEED
     sta player_x
@@ -214,6 +227,10 @@ forever:
     lda pad1
     and #BTN_RIGHT
     beq @no_right
+    lda #$00           ; 右向き (反転なし)
+    sta facing_attr
+    lda #1
+    sta moving
     lda player_x
     cmp #X_MAX
     bcs @no_right      ; 右端なら動かさない
@@ -276,6 +293,40 @@ forever:
 @save_pad:
     lda pad1           ; 次フレームのエッジ検出用に保存
     sta pad1_prev
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; アニメ: キャラのタイル(OAM+1)と向き(OAM+2)を決める
+;   歩行中(moving=1): anim_timer を進めて A/B を 8フレーム周期で交互
+;   停止中: フレームAで固定・カウンタリセット
+;   向きは move_player がセットした facing_attr を反映
+; -------------------------------------------------------------
+.proc animate
+    lda moving
+    beq @idle
+
+    inc anim_timer
+    lda anim_timer
+    and #ANIM_MASK
+    beq @frame_a
+    lda #TILE_WALK_B
+    jmp @set_tile
+@frame_a:
+    lda #TILE_WALK_A
+@set_tile:
+    sta OAM+1
+    jmp @attr
+
+@idle:
+    lda #0
+    sta anim_timer
+    lda #TILE_WALK_A
+    sta OAM+1
+
+@attr:
+    lda facing_attr
+    sta OAM+2
     rts
 .endproc
 
@@ -363,26 +414,23 @@ palette:
 
 ; -------------------------------------------------------------
 ; CHR-ROM (8KB)
-;   タイル0 = 空白 / タイル1 = キャラ絵(目が空いた丸)
+;   タイル0=空白 / 1=歩行A / 2=地面 / 3=歩行B
 ;   1タイル = 16byte (plane0 8byte + plane1 8byte)
+;   キャラ: body=index1(赤), 目=index3(白)。右側に目→反転で左右の向きが出る
 ; -------------------------------------------------------------
 .segment "CHARS"
     ; タイル0: 空白
     .res 16, $00
-    ; タイル1: キャラ絵 (color index 1 で塗り、目の2pxは透明)
-    .byte %00111100    ; plane 0
-    .byte %01111110
-    .byte %11011011
-    .byte %11111111
-    .byte %11111111
-    .byte %11111111
-    .byte %01111110
-    .byte %00111100
-    .byte $00,$00,$00,$00,$00,$00,$00,$00   ; plane 1 (全0 → 色は index1)
+    ; タイル1: キャラ 歩行フレームA (右向き)
+    .byte $3c,$7e,$ff,$ff,$ff,$ff,$66,$c2   ; plane 0 (キャラ全体)
+    .byte $00,$00,$00,$04,$00,$00,$00,$00   ; plane 1 (目 index3 のみ)
     ; タイル2: レンガの地面 (本体=index1 茶 / 目地=index3 白)
     ;   plane0 は全ピクセル1 (index1/3 はどちらも plane0=1)
     ;   plane1 が1の所だけ目地(index3)。上半分と下半分で継ぎ目をずらす
     .byte $ff,$ff,$ff,$ff,$ff,$ff,$ff,$ff   ; plane 0
     .byte $ff,$10,$10,$10,$ff,$01,$01,$01   ; plane 1 (横ライン+縦継ぎ目)
-    ; 残りを 0 で埋めて 8KB に (タイル0..2 = 48byte)
-    .res 8192 - 48, $00
+    ; タイル3: キャラ 歩行フレームB (足の位置だけ違う)
+    .byte $3c,$7e,$ff,$ff,$ff,$ff,$66,$43   ; plane 0
+    .byte $00,$00,$00,$04,$00,$00,$00,$00   ; plane 1 (目 index3 のみ)
+    ; 残りを 0 で埋めて 8KB に (タイル0..3 = 64byte)
+    .res 8192 - 64, $00
