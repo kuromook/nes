@@ -36,6 +36,9 @@ GRAVITY  = 40      ; 重力加速度 (1/256 px/frame^2)
 JUMP_VEL = $FC00   ; ジャンプ初速 = -4.0 px/frame (8.8 符号付き)
 FLOOR_Y  = 208     ; 地面の上に立つ Y (地面 row27=y216, スプライト8px)
 
+; ---- 足場 (プラットフォーム) ----
+NUM_PLATFORMS = 3  ; 足場の枚数 (plat_top/x0/x1 テーブルと一致させる)
+
 ; ---- 背景タイル / ステージ ----
 TILE_SKY    = 0    ; 空 (空白タイル)
 TILE_GROUND = 2    ; 地面 (レンガタイル)
@@ -64,7 +67,10 @@ pad1_prev: .res 1   ; 前フレームのボタン状態 (エッジ検出用)
 facing_attr:.res 1  ; キャラの向き = OAM 属性 (0=右 / $40=左反転)
 anim_timer:.res 1   ; 歩行アニメ用フレームカウンタ
 moving:    .res 1   ; このフレームに横入力があったか (1=歩行中)
+prev_y:    .res 1   ; 更新前の Y (足場の通過判定に使う)
 bg_tile:   .res 1   ; 背景描画ループの一時タイル番号
+ptr_lo:    .res 1   ; 汎用ポインタ下位 (足場描画でPPUADDR計算に使用)
+ptr_hi:    .res 1   ; 汎用ポインタ上位
 
 ; -------------------------------------------------------------
 ; iNES ヘッダ
@@ -265,6 +271,8 @@ forever:
     sta vy_hi
 
     ; --- 位置更新: (player_y.py_sub) += vy  (8.8 符号付き加算) ---
+    lda player_y
+    sta prev_y         ; 通過判定用に更新前のYを保存
     clc
     lda py_sub
     adc vy_lo
@@ -272,6 +280,50 @@ forever:
     lda player_y
     adc vy_hi
     sta player_y
+
+    ; --- 足場(プラットフォーム)との当たり判定 (落下中のみ=一方通行) ---
+    lda vy_hi
+    bmi @after_plat    ; vy<0 (上昇中) は足場を通り抜ける
+    ldy #NUM_PLATFORMS-1
+@ploop:
+    ; X 重なり: player_x < x1 かつ player_x+7 >= x0
+    lda player_x
+    cmp plat_x1,y
+    bcs @pnext         ; player_x >= x1 → 横が重ならない
+    lda player_x
+    clc
+    adc #7
+    cmp plat_x0,y
+    bcc @pnext         ; player_x+7 < x0 → 横が重ならない
+    ; 縦の通過: prev_feet <= top かつ new_feet >= top
+    lda prev_y
+    clc
+    adc #8             ; prev_feet
+    cmp plat_top,y
+    beq @pcheck_new    ; ==top はOK
+    bcs @pnext         ; prev_feet > top → 既に下にいた
+@pcheck_new:
+    lda player_y
+    clc
+    adc #8             ; new_feet
+    cmp plat_top,y
+    bcc @pnext         ; new_feet < top → まだ届いていない
+    ; 着地: 足場の上にスナップして停止
+    lda plat_top,y
+    sec
+    sbc #8
+    sta player_y
+    lda #0
+    sta py_sub
+    sta vy_lo
+    sta vy_hi
+    lda #1
+    sta on_ground
+    jmp @save_pad
+@pnext:
+    dey
+    bpl @ploop
+@after_plat:
 
     ; --- 地面との当たり判定 ---
     lda player_y
@@ -370,6 +422,73 @@ forever:
     sta PPUDATA
     dey
     bne @attr
+
+    jsr draw_platforms    ; 足場をネームテーブルへ上書き
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; 足場描画: plat_top/x0/x1 の各足場をレンガ(タイル2)で描く
+;   ネームテーブルアドレス = $2000 + top*4 + x0/8
+;     (top=row*8 なので top*4 = row*32 = 行頭オフセット)
+;   タイル数 = (x1 - x0) / 8
+; -------------------------------------------------------------
+.proc draw_platforms
+    ldy #0
+@ploop:
+    cpy #NUM_PLATFORMS
+    bcs @done
+
+    ; ptr = top*4
+    lda plat_top,y
+    sta ptr_lo
+    lda #0
+    sta ptr_hi
+    asl ptr_lo
+    rol ptr_hi
+    asl ptr_lo
+    rol ptr_hi
+    ; ptr += x0/8
+    lda plat_x0,y
+    lsr a
+    lsr a
+    lsr a
+    clc
+    adc ptr_lo
+    sta ptr_lo
+    lda ptr_hi
+    adc #0
+    sta ptr_hi
+    ; ptr += $2000
+    lda ptr_hi
+    clc
+    adc #$20
+    sta ptr_hi
+
+    ; PPUADDR = ptr
+    bit PPUSTATUS
+    lda ptr_hi
+    sta PPUADDR
+    lda ptr_lo
+    sta PPUADDR
+
+    ; タイル数 = (x1-x0)/8 → X
+    lda plat_x1,y
+    sec
+    sbc plat_x0,y
+    lsr a
+    lsr a
+    lsr a
+    tax
+@wloop:
+    lda #TILE_GROUND
+    sta PPUDATA
+    dex
+    bne @wloop
+
+    iny
+    jmp @ploop
+@done:
     rts
 .endproc
 
@@ -403,6 +522,15 @@ palette:
     ; スプライトパレット
     .byte $0f,$16,$27,$30,  $0f,$1a,$2a,$30
     .byte $0f,$12,$22,$30,  $0f,$14,$24,$30
+
+; -------------------------------------------------------------
+; 足場テーブル (ピクセル座標 / 描画と当たり判定で共用)
+;   top = 上面Y / x0 = 左端X / x1 = 右端X(排他)。タイル境界(8の倍数)
+;   右上へ向かう階段状の3枚 (row22/18/14, 幅4/5/5 タイル)
+; -------------------------------------------------------------
+plat_top: .byte 176, 144, 112   ; row 22 / 18 / 14 (*8)
+plat_x0:  .byte  32,  96, 176   ; col 4 / 12 / 22 (*8)
+plat_x1:  .byte  64, 136, 216   ; col 8 / 17 / 27 (*8)
 
 ; -------------------------------------------------------------
 ; 割り込みベクタ
