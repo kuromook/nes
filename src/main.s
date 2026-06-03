@@ -1,17 +1,20 @@
 ; =============================================================
-; NES コントローラ入力デモ (ca65 / NROM-256, mapper 0)
-;   押したボタンで画面全体の背景色が変わる。
-;     ↑=緑 ↓=赤 ←=黄 →=水色 / A=白 B=マゼンタ / 無押下=黒
-;   $4016 から1コントローラ分(8ボタン)を読み取る基本形。
+; NES スプライト移動デモ (ca65 / NROM-256, mapper 0)
+;   十字キーでキャラ(8x8スプライト)が上下左右に動く。
+;   - CHR にキャラ絵(タイル1)を用意
+;   - OAM バッファ($0200)を OAM DMA($4014)で毎フレーム転送
+;   - 十字キー入力で player_x / player_y を増減
 ; =============================================================
 
-; ---- PPU / コントローラ レジスタ ----
+; ---- PPU / コントローラ / DMA レジスタ ----
 PPUCTRL   = $2000
 PPUMASK   = $2001
 PPUSTATUS = $2002
+OAMADDR   = $2003
 PPUSCROLL = $2005
 PPUADDR   = $2006
 PPUDATA   = $2007
+OAMDMA    = $4014
 JOYPAD1   = $4016
 
 ; ---- ボタンビット (pad1 内の並び: A B Sel St U D L R) ----
@@ -24,22 +27,30 @@ BTN_DOWN   = %00000100
 BTN_LEFT   = %00000010
 BTN_RIGHT  = %00000001
 
+; ---- 移動パラメータ ----
+SPEED = 2
+X_MAX = 248        ; 画面右端 (256 - 8px)
+Y_MAX = 224        ; 下方向の上限
+
+OAM = $0200        ; OAM バッファ (1ページ = スプライト64個分)
+
 ; -------------------------------------------------------------
 ; 変数 (ゼロページ)
 ; -------------------------------------------------------------
 .segment "ZEROPAGE"
-pad1:    .res 1         ; 現在のボタン状態
-bgcolor: .res 1         ; 表示する背景色 ($3F00 に書く値)
+pad1:     .res 1   ; ボタン状態
+player_x: .res 1   ; キャラ X 座標
+player_y: .res 1   ; キャラ Y 座標
 
 ; -------------------------------------------------------------
-; iNES ヘッダ (16 byte)
+; iNES ヘッダ
 ; -------------------------------------------------------------
 .segment "HEADER"
     .byte "NES", $1A
-    .byte 2            ; PRG-ROM 2 * 16KB = 32KB
-    .byte 1            ; CHR-ROM 1 * 8KB
-    .byte $00          ; flags6 : mapper 0
-    .byte $00          ; flags7
+    .byte 2            ; PRG 32KB
+    .byte 1            ; CHR 8KB
+    .byte $00          ; mapper 0
+    .byte $00
     .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; -------------------------------------------------------------
@@ -50,22 +61,21 @@ bgcolor: .res 1         ; 表示する背景色 ($3F00 に書く値)
     sei
     cld
     ldx #$40
-    stx $4017          ; APU フレーム IRQ 無効
+    stx $4017
     ldx #$ff
     txs
     inx                ; X = 0
-    stx PPUCTRL        ; NMI 無効
-    stx PPUMASK        ; 描画オフ
-    stx $4010          ; DMC IRQ 無効
+    stx PPUCTRL
+    stx PPUMASK
+    stx $4010
 
-:   bit PPUSTATUS      ; 1回目の vblank 待ち
+:   bit PPUSTATUS      ; 1回目 vblank
     bpl :-
 
     txa                ; RAM クリア
 clear_ram:
     sta $0000, x
     sta $0100, x
-    sta $0200, x
     sta $0300, x
     sta $0400, x
     sta $0500, x
@@ -74,10 +84,18 @@ clear_ram:
     inx
     bne clear_ram
 
-:   bit PPUSTATUS      ; 2回目の vblank 待ち
+    ; OAM バッファを $FF で埋めて全スプライトを画面外に隠す
+    lda #$ff
+    ldx #0
+clear_oam:
+    sta OAM, x
+    inx
+    bne clear_oam
+
+:   bit PPUSTATUS      ; 2回目 vblank
     bpl :-
 
-    ; パレット書き込み ($3F00-)
+    ; パレット書き込み
     bit PPUSTATUS
     lda #$3f
     sta PPUADDR
@@ -91,24 +109,27 @@ load_palette:
     cpx #32
     bne load_palette
 
-    lda #$0f           ; 背景色の初期値 = 黒
-    sta bgcolor
+    ; キャラ初期位置 (画面中央付近)
+    lda #120
+    sta player_x
+    lda #112
+    sta player_y
 
     lda #$00           ; スクロール初期化
     sta PPUADDR
     sta PPUADDR
 
-    lda #%10000000     ; NMI 有効
+    lda #%10000000     ; NMI 有効 / パターンテーブルは $0000
     sta PPUCTRL
-    lda #%00001110     ; 背景表示 ON
+    lda #%00011110     ; 背景 + スプライト 表示 ON
     sta PPUMASK
 
 forever:
-    jmp forever        ; あとは NMI に任せる
+    jmp forever
 .endproc
 
 ; -------------------------------------------------------------
-; NMI (毎フレーム vblank): 入力読取 → 色決定 → 画面反映
+; NMI: 入力読取 → 移動 → OAM更新 → DMA転送 → スクロール戻し
 ; -------------------------------------------------------------
 .proc nmi
     pha
@@ -118,21 +139,27 @@ forever:
     pha
 
     jsr read_controller
-    jsr update_color
+    jsr move_player
 
-    ; 背景色 $3F00 を更新 (vblank 中なので書き込み可)
+    ; スプライト0 (キャラ) を OAM バッファへ書き込み
+    lda player_y
+    sta OAM+0          ; Y 座標
+    lda #1
+    sta OAM+1          ; タイル番号 (1 = キャラ絵)
+    lda #0
+    sta OAM+2          ; 属性 (パレット0 / 反転なし)
+    lda player_x
+    sta OAM+3          ; X 座標
+
+    ; OAM DMA: $0200-$02FF を PPU の OAM へ一括転送
+    lda #$00
+    sta OAMADDR
+    lda #>OAM          ; = $02
+    sta OAMDMA
+
+    ; スクロールを 0 に戻す
     bit PPUSTATUS
-    lda #$3f
-    sta PPUADDR
     lda #$00
-    sta PPUADDR
-    lda bgcolor
-    sta PPUDATA
-
-    ; VRAM アドレス / スクロールを 0 に戻す
-    lda #$00
-    sta PPUADDR
-    sta PPUADDR
     sta PPUSCROLL
     sta PPUSCROLL
 
@@ -145,91 +172,116 @@ forever:
 .endproc
 
 ; -------------------------------------------------------------
+; 十字キーで player_x / player_y を更新 (画面端でクランプ)
+; -------------------------------------------------------------
+.proc move_player
+    ; --- 左 ---
+    lda pad1
+    and #BTN_LEFT
+    beq @no_left
+    lda player_x
+    cmp #SPEED
+    bcc @no_left       ; 左端なら動かさない
+    sec
+    sbc #SPEED
+    sta player_x
+@no_left:
+
+    ; --- 右 ---
+    lda pad1
+    and #BTN_RIGHT
+    beq @no_right
+    lda player_x
+    cmp #X_MAX
+    bcs @no_right      ; 右端なら動かさない
+    clc
+    adc #SPEED
+    sta player_x
+@no_right:
+
+    ; --- 上 ---
+    lda pad1
+    and #BTN_UP
+    beq @no_up
+    lda player_y
+    cmp #SPEED
+    bcc @no_up
+    sec
+    sbc #SPEED
+    sta player_y
+@no_up:
+
+    ; --- 下 ---
+    lda pad1
+    and #BTN_DOWN
+    beq @no_down
+    lda player_y
+    cmp #Y_MAX
+    bcs @no_down
+    clc
+    adc #SPEED
+    sta player_y
+@no_down:
+
+    rts
+.endproc
+
+; -------------------------------------------------------------
 ; コントローラ1 を読み取り pad1 に格納
-;   ストローブ後 8 回読むと pad1 = A B Sel St U D L R (bit7..0)
 ; -------------------------------------------------------------
 .proc read_controller
     lda #$01
     sta JOYPAD1
     lda #$00
-    sta JOYPAD1        ; 1→0 で状態をラッチ
+    sta JOYPAD1
     ldx #8
 loop:
-    lda JOYPAD1        ; bit0 にボタン状態 (1=押下)
-    lsr a              ; bit0 → キャリー
-    rol pad1           ; キャリーを pad1 に取り込む
+    lda JOYPAD1
+    lsr a
+    rol pad1
     dex
     bne loop
     rts
 .endproc
 
 ; -------------------------------------------------------------
-; pad1 の内容から bgcolor を決定
-;   複数同時押し時は後で評価したボタンが優先される
-; -------------------------------------------------------------
-.proc update_color
-    lda #$0f           ; 既定: 黒
-    sta bgcolor
-
-    lda pad1
-    and #BTN_UP
-    beq :+
-    lda #$2a           ; 緑
-    sta bgcolor
-:
-    lda pad1
-    and #BTN_DOWN
-    beq :+
-    lda #$16           ; 赤
-    sta bgcolor
-:
-    lda pad1
-    and #BTN_LEFT
-    beq :+
-    lda #$28           ; 黄
-    sta bgcolor
-:
-    lda pad1
-    and #BTN_RIGHT
-    beq :+
-    lda #$21           ; 水色
-    sta bgcolor
-:
-    lda pad1
-    and #BTN_B
-    beq :+
-    lda #$14           ; マゼンタ
-    sta bgcolor
-:
-    lda pad1
-    and #BTN_A
-    beq :+
-    lda #$30           ; 白
-    sta bgcolor
-:
-    rts
-.endproc
-
-; -------------------------------------------------------------
-; パレットデータ
+; パレット (BG 16 + スプライト 16)
+;   スプライトパレット0 の色1 = $16(赤) → キャラ本体の色
 ; -------------------------------------------------------------
 .segment "RODATA"
 palette:
-    .byte $0f,$10,$30,$0f,  $0f,$06,$16,$0f
-    .byte $0f,$09,$19,$0f,  $0f,$01,$11,$0f
-    .byte $0f,$10,$30,$0f,  $0f,$06,$16,$0f
-    .byte $0f,$09,$19,$0f,  $0f,$01,$11,$0f
+    ; 背景パレット (今回は背景色 $3F00=$0f 黒 のみ見える)
+    .byte $0f,$00,$10,$30,  $0f,$00,$10,$30
+    .byte $0f,$00,$10,$30,  $0f,$00,$10,$30
+    ; スプライトパレット
+    .byte $0f,$16,$27,$30,  $0f,$1a,$2a,$30
+    .byte $0f,$12,$22,$30,  $0f,$14,$24,$30
 
 ; -------------------------------------------------------------
 ; 割り込みベクタ
 ; -------------------------------------------------------------
 .segment "VECTORS"
-    .word nmi          ; $FFFA: NMI
-    .word reset        ; $FFFC: RESET
-    .word 0            ; $FFFE: IRQ/BRK
+    .word nmi
+    .word reset
+    .word 0
 
 ; -------------------------------------------------------------
-; CHR-ROM (8KB) — タイルは未使用 (全0)
+; CHR-ROM (8KB)
+;   タイル0 = 空白 / タイル1 = キャラ絵(目が空いた丸)
+;   1タイル = 16byte (plane0 8byte + plane1 8byte)
 ; -------------------------------------------------------------
 .segment "CHARS"
-    .res 8192, $00
+    ; タイル0: 空白
+    .res 16, $00
+    ; タイル1: キャラ絵 (color index 1 で塗り、目の2pxは透明)
+    .byte %00111100    ; plane 0
+    .byte %01111110
+    .byte %11011011
+    .byte %11111111
+    .byte %11111111
+    .byte %11111111
+    .byte %01111110
+    .byte %00111100
+    .byte $00,$00,$00,$00,$00,$00,$00,$00   ; plane 1 (全0 → 色は index1)
+    ; 残りを 0 で埋めて 8KB に
+    .res 8192 - 32, $00
