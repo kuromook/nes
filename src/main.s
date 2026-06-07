@@ -68,6 +68,14 @@ SPIKE_PAL  = %00000011   ; OAM 属性: スプライトパレット3 (灰)
 SPIKE_SLOT0 = 52         ; トゲの OAM 開始オフセット (スロット13 = 13*4)
 ;   触れたら即死 → init_game_state で最初から完全リスタート
 
+; ---- 敵キャラ (動く障害物) ----
+NUM_ENEMIES = 3          ; 敵の数 (enemy_* テーブルと一致させる)
+TILE_ENEMY  = 16         ; 敵の CHR タイル番号
+ENEMY_PAL   = %00000011  ; OAM 属性: スプライトパレット3 (トゲと共有 / 敵は index2=緑)
+ENEMY_SLOT0 = 68         ; 敵の OAM 開始オフセット (スロット17 = 17*4)
+ENEMY_SPEED = 1          ; 敵の移動速度 (px/frame)
+;   地面を左右に往復 (端で反転)。触れたら即死
+
 ; ---- 背景タイル / ステージ ----
 TILE_SKY    = 0    ; 空 (空白タイル)
 TILE_GROUND = 2    ; 地面 (レンガタイル)
@@ -113,6 +121,9 @@ next_coin: .res 1   ; 次に取るべきコイン番号 (0..8 / 順番制)
 frame_cnt: .res 1   ; NMI ごとに +1 (点滅などの周期用)
 coin_active: .res NUM_COINS ; コイン表示フラグ (1=未取得/表示, 0=取得済)
 score_dec: .res HUD_DIGITS  ; 得点の10進各桁 (表示用 / bin2dec の出力)
+enemy_x_lo: .res NUM_ENEMIES ; 敵の現在X 下位 (RAM)
+enemy_x_hi: .res NUM_ENEMIES ; 敵の現在X 上位 (画面内patrolなので不変)
+enemy_dir:  .res NUM_ENEMIES ; 敵の進行方向 (0=右 / 1=左)
 
 ; -------------------------------------------------------------
 ; iNES ヘッダ
@@ -227,6 +238,17 @@ forever:
     sta coin_active, x
     dex
     bpl @init_coins
+
+    ldx #NUM_ENEMIES-1 ; 敵を初期位置(min)・右向きへ
+@init_enemies:
+    lda enemy_min_lo, x
+    sta enemy_x_lo, x
+    lda enemy_min_hi, x
+    sta enemy_x_hi, x
+    lda #0
+    sta enemy_dir, x
+    dex
+    bpl @init_enemies
     rts
 .endproc
 
@@ -245,7 +267,9 @@ forever:
     jsr read_controller
     jsr move_player
     jsr update_coins   ; コイン取得判定 → 得点加算 (ワールド座標, カメラ不要)
+    jsr update_enemies ; 敵を左右に動かす
     jsr check_spikes   ; トゲ当たり判定 → 触れたら最初からリスタート
+    jsr check_enemies  ; 敵当たり判定 → 触れたら最初からリスタート
     jsr update_camera  ; camera_lo/hi と screen_x を計算 (リスタート後の位置も反映)
 
     ; スプライト0 (キャラ) を OAM バッファへ書き込み
@@ -256,6 +280,7 @@ forever:
     jsr animate        ; OAM+1(タイル) と OAM+2(属性=向き) をセット
     jsr draw_coins     ; コイン(スロット1-8) と 得点HUD(スロット9-12) を描画
     jsr draw_spikes    ; トゲ(スロット13-16) を描画
+    jsr draw_enemies   ; 敵(スロット17-19) を描画
 
     ; OAM DMA: $0200-$02FF を PPU の OAM へ一括転送
     lda #$00
@@ -715,6 +740,128 @@ forever:
 .endproc
 
 ; -------------------------------------------------------------
+; 敵の移動: 地面を左右に往復 (端 [min,max] で反転)
+;   画面内 patrol 前提なので x_lo の 8bit 演算で済む (x_hi は不変)
+; -------------------------------------------------------------
+.proc update_enemies
+    ldx #0
+@loop:
+    lda enemy_dir, x
+    bne @left
+    ; --- 右へ ---
+    clc
+    lda enemy_x_lo, x
+    adc #ENEMY_SPEED
+    sta enemy_x_lo, x
+    cmp enemy_max_lo, x
+    bcc @next          ; < max → まだ進める
+    lda enemy_max_lo, x ; max に到達 → クランプして左向きへ
+    sta enemy_x_lo, x
+    lda #1
+    sta enemy_dir, x
+    jmp @next
+@left:
+    ; --- 左へ ---
+    sec
+    lda enemy_x_lo, x
+    sbc #ENEMY_SPEED
+    sta enemy_x_lo, x
+    cmp enemy_min_lo, x
+    bcs @next          ; >= min → まだ進める
+    lda enemy_min_lo, x ; min を下回った → クランプして右向きへ
+    sta enemy_x_lo, x
+    lda #0
+    sta enemy_dir, x
+@next:
+    inx
+    cpx #NUM_ENEMIES
+    bne @loop
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; 敵当たり判定: プレイヤーがどれかの敵に重なったら即死→完全リスタート
+; -------------------------------------------------------------
+.proc check_enemies
+    ldx #0
+@loop:
+    sec
+    lda px_lo
+    sbc enemy_x_lo, x
+    sta tmp_lo
+    lda px_hi
+    sbc enemy_x_hi, x
+    sta tmp_hi
+    clc
+    lda tmp_lo
+    adc #7
+    sta tmp_lo
+    lda tmp_hi
+    adc #0
+    bne @next
+    lda tmp_lo
+    cmp #15
+    bcs @next
+    lda player_y
+    sec
+    sbc enemy_y, x
+    clc
+    adc #7
+    cmp #15
+    bcs @next
+    jsr init_game_state ; 衝突! 完全リスタート
+    rts
+@next:
+    inx
+    cpx #NUM_ENEMIES
+    bne @loop
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; 敵描画 (スロット17-19): 画面内X = ex - camera。進行方向で左右反転
+; -------------------------------------------------------------
+.proc draw_enemies
+    ldx #0
+    ldy #ENEMY_SLOT0
+@loop:
+    sec
+    lda enemy_x_lo, x
+    sbc camera_lo
+    sta tmp_lo
+    lda enemy_x_hi, x
+    sbc camera_hi
+    bne @hide          ; 画面外
+    lda enemy_y, x
+    sta OAM, y
+    lda #TILE_ENEMY
+    sta OAM+1, y
+    lda enemy_dir, x   ; 属性: 左向き(dir=1)なら水平反転
+    beq @right
+    lda #ENEMY_PAL | $40
+    jmp @setattr
+@right:
+    lda #ENEMY_PAL
+@setattr:
+    sta OAM+2, y
+    lda tmp_lo
+    sta OAM+3, y
+    jmp @next
+@hide:
+    lda #$ff
+    sta OAM, y
+@next:
+    iny
+    iny
+    iny
+    iny
+    inx
+    cpx #NUM_ENEMIES
+    bne @loop
+    rts
+.endproc
+
+; -------------------------------------------------------------
 ; コイン描画 (スロット1-8) ＋ 得点HUD (スロット9)
 ;   各コイン: 画面内X = cx - camera。0..255 に収まる時だけ表示
 ;   未取得かつ画面内のみ表示、それ以外は Y=$FF で隠す
@@ -980,9 +1127,10 @@ palette:
     ; 背景パレット0: $3F00=空の青(backdrop) / 1=レンガ茶 / 2=明茶 / 3=目地の白
     .byte $22,$07,$17,$30,  $22,$07,$17,$30
     .byte $22,$07,$17,$30,  $22,$07,$17,$30
-    ; スプライトパレット 0=キャラ(赤) / 1=コイン(金) / 2=得点(白) / 3=トゲ(灰)
+    ; スプライトパレット 0=キャラ(赤) / 1=コイン(金) / 2=得点(白)
+    ; 3 はトゲ(index1=灰) と 敵(index2=緑) で共有 / index3=白(目)
     .byte $0f,$16,$27,$30,  $0f,$28,$27,$30
-    .byte $0f,$30,$30,$30,  $0f,$10,$00,$30
+    .byte $0f,$30,$30,$30,  $0f,$10,$2a,$30
 
 ; -------------------------------------------------------------
 ; 足場テーブル (ワールド・ピクセル座標 / 描画と当たり判定で共用)
@@ -1017,6 +1165,16 @@ pow10_hi:    .byte >1000, >100, >10
 spike_x_lo:  .byte 160, 240,  80, 160   ; (x_hi=1 側は 256+80=336, 256+160=416)
 spike_x_hi:  .byte   0,   0,   1,   1
 spike_y:     .byte 208, 208, 208, 208
+
+; -------------------------------------------------------------
+; 敵テーブル (ワールド・ピクセル座標 / 8x8)
+;   地面(y=208)を [min,max] の範囲で左右に往復。各敵は1画面内に収める
+;   (x_hi は min/max で共通。トゲの x とは重ならない位置に)
+; -------------------------------------------------------------
+enemy_min_lo: .byte  60,  14, 174   ; 左端X 下位 (E1/E2 は x_hi=1 → world 270/430)
+enemy_min_hi: .byte   0,   1,   1
+enemy_max_lo: .byte 150, 104, 219   ; 右端X 下位 (world 150 / 360 / 475)
+enemy_y:      .byte 208, 208, 208
 
 ; -------------------------------------------------------------
 ; 割り込みベクタ
@@ -1073,5 +1231,8 @@ spike_y:     .byte 208, 208, 208, 208
     ; タイル15: トゲ (上向きの三角 / index1 灰)
     .byte $18,$18,$3c,$3c,$7e,$7e,$ff,$ff   ; plane 0
     .byte $00,$00,$00,$00,$00,$00,$00,$00   ; plane 1
-    ; 残りを 0 で埋めて 8KB に (タイル0..15 = 256byte)
-    .res 8192 - 256, $00
+    ; タイル16: 敵 (緑のブロブ=index2 / 目=index3 白)
+    .byte $00,$00,$00,$24,$00,$00,$00,$00   ; plane 0 (目だけ → 重なり部が index3)
+    .byte $3c,$7e,$ff,$ff,$ff,$ff,$ff,$db   ; plane 1 (体 → index2 緑)
+    ; 残りを 0 で埋めて 8KB に (タイル0..16 = 272byte)
+    .res 8192 - 272, $00
