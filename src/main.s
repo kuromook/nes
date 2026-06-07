@@ -76,6 +76,24 @@ ENEMY_SLOT0 = 68         ; 敵の OAM 開始オフセット (スロット17 = 17
 ENEMY_SPEED = 1          ; 敵の移動速度 (px/frame)
 ;   地面を左右に往復 (端で反転)。触れたら即死
 
+; ---- ゴール (全コイン取得で出現) ----
+TILE_GOAL  = 17          ; ゴールの CHR タイル (金の星)
+GOAL_PAL   = %00000001   ; OAM 属性: スプライトパレット1 (金)
+GOAL_SLOT  = 80          ; ゴールの OAM オフセット (スロット20 = 20*4)
+GOAL_X     = 16          ; ゴールのワールドX (左端＝コイン群から離した出口)
+GOAL_Y     = 204         ; ゴールのY (地面に立つプレイヤーと重なる高さ)
+
+; ---- ステージクリア表示 "CLEAR" ----
+TILE_C     = 18          ; 文字タイル C/L/E/A/R = 18..22
+TILE_L     = 19
+TILE_E     = 20
+TILE_A     = 21
+TILE_R     = 22
+CLEAR_SLOT0 = 84         ; "CLEAR" の OAM 開始オフセット (スロット21)
+CLEAR_PAL  = %00000010   ; スプライトパレット2 (白)
+CLEAR_X    = 108         ; 5文字×8px=40px を画面中央へ
+CLEAR_Y    = 64          ; 空の高い位置 (足場のレンガに重ならないよう)
+
 ; ---- 背景タイル / ステージ ----
 TILE_SKY    = 0    ; 空 (空白タイル)
 TILE_GROUND = 2    ; 地面 (レンガタイル)
@@ -124,6 +142,7 @@ score_dec: .res HUD_DIGITS  ; 得点の10進各桁 (表示用 / bin2dec の出�
 enemy_x_lo: .res NUM_ENEMIES ; 敵の現在X 下位 (RAM)
 enemy_x_hi: .res NUM_ENEMIES ; 敵の現在X 上位 (画面内patrolなので不変)
 enemy_dir:  .res NUM_ENEMIES ; 敵の進行方向 (0=右 / 1=左)
+cleared:    .res 1   ; ステージクリア状態 (0=プレイ中 / 1=クリア)
 
 ; -------------------------------------------------------------
 ; iNES ヘッダ
@@ -230,6 +249,7 @@ forever:
     sta score_lo       ; 得点 0
     sta score_hi
     sta next_coin      ; 最初に取るコイン = 0番
+    sta cleared        ; クリア状態を解除
     lda #COIN_MAX      ; コンボ残量を初期化
     sta combo_rem
     ldx #NUM_COINS-1   ; 全コインを「未取得(表示)」に
@@ -265,12 +285,27 @@ forever:
     inc frame_cnt      ; 点滅などの周期カウンタ
 
     jsr read_controller
+
+    lda cleared
+    bne @frozen        ; クリア後はゲーム更新を止める (Startで再開)
+
+    ; --- プレイ中: ゲーム更新 ---
     jsr move_player
     jsr update_coins   ; コイン取得判定 → 得点加算 (ワールド座標, カメラ不要)
     jsr update_enemies ; 敵を左右に動かす
     jsr check_spikes   ; トゲ当たり判定 → 触れたら最初からリスタート
     jsr check_enemies  ; 敵当たり判定 → 触れたら最初からリスタート
-    jsr update_camera  ; camera_lo/hi と screen_x を計算 (リスタート後の位置も反映)
+    jsr check_goal     ; 全コイン取得後、ゴール接触で cleared=1
+    jmp @render
+
+@frozen:
+    lda pad1           ; クリア画面: Start で最初から
+    and #BTN_START
+    beq @render
+    jsr init_game_state
+
+@render:
+    jsr update_camera  ; camera_lo/hi と screen_x を計算
 
     ; スプライト0 (キャラ) を OAM バッファへ書き込み
     lda player_y
@@ -281,6 +316,8 @@ forever:
     jsr draw_coins     ; コイン(スロット1-8) と 得点HUD(スロット9-12) を描画
     jsr draw_spikes    ; トゲ(スロット13-16) を描画
     jsr draw_enemies   ; 敵(スロット17-19) を描画
+    jsr draw_goal      ; ゴール(スロット20) を描画 (全コイン取得後のみ)
+    jsr draw_clear     ; "CLEAR"(スロット21-25) を描画 (cleared 時のみ)
 
     ; OAM DMA: $0200-$02FF を PPU の OAM へ一括転送
     lda #$00
@@ -862,6 +899,123 @@ forever:
 .endproc
 
 ; -------------------------------------------------------------
+; ゴール判定: 全コイン取得済(next_coin>=NUM_COINS)で、プレイヤーが
+;   ゴール(GOAL_X,GOAL_Y)に重なったら cleared=1 (ステージクリア)
+; -------------------------------------------------------------
+.proc check_goal
+    lda next_coin
+    cmp #NUM_COINS
+    bcc @done           ; まだ全部取ってない → ゴール無し
+    ; X 重なり: dx = px - GOAL_X (16bit)
+    sec
+    lda px_lo
+    sbc #<GOAL_X
+    sta tmp_lo
+    lda px_hi
+    sbc #>GOAL_X
+    sta tmp_hi
+    clc
+    lda tmp_lo
+    adc #7
+    sta tmp_lo
+    lda tmp_hi
+    adc #0
+    bne @done
+    lda tmp_lo
+    cmp #15
+    bcs @done
+    ; Y 重なり
+    lda player_y
+    sec
+    sbc #GOAL_Y
+    clc
+    adc #7
+    cmp #15
+    bcs @done
+    lda #1              ; クリア!
+    sta cleared
+@done:
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; ゴール描画 (スロット20): 全コイン取得後のみ表示。画面外は隠す
+; -------------------------------------------------------------
+.proc draw_goal
+    lda next_coin
+    cmp #NUM_COINS
+    bcc @hide           ; 全部取るまで非表示
+    ; 画面内X = GOAL_X - camera
+    sec
+    lda #<GOAL_X
+    sbc camera_lo
+    sta tmp_lo
+    lda #>GOAL_X
+    sbc camera_hi
+    bne @hide           ; 画面外
+    lda #GOAL_Y
+    sta OAM+GOAL_SLOT
+    lda #TILE_GOAL
+    sta OAM+GOAL_SLOT+1
+    lda #GOAL_PAL
+    sta OAM+GOAL_SLOT+2
+    lda tmp_lo
+    sta OAM+GOAL_SLOT+3
+    rts
+@hide:
+    lda #$ff
+    sta OAM+GOAL_SLOT
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; "CLEAR" 描画 (スロット21-25): cleared 時のみ画面中央に表示
+; -------------------------------------------------------------
+.proc draw_clear
+    lda cleared
+    beq @hide
+    ldx #0
+@loop:
+    txa                ; OAM オフセット = CLEAR_SLOT0 + 文字*4
+    asl a
+    asl a
+    clc
+    adc #CLEAR_SLOT0
+    tay
+    lda #CLEAR_Y
+    sta OAM, y
+    lda clear_tiles, x
+    sta OAM+1, y
+    lda #CLEAR_PAL
+    sta OAM+2, y
+    txa                ; 画面内X = CLEAR_X + 文字*8
+    asl a
+    asl a
+    asl a
+    clc
+    adc #CLEAR_X
+    sta OAM+3, y
+    inx
+    cpx #5
+    bne @loop
+    rts
+@hide:
+    ldx #0
+    ldy #CLEAR_SLOT0
+@hloop:
+    lda #$ff
+    sta OAM, y
+    iny
+    iny
+    iny
+    iny
+    inx
+    cpx #5
+    bne @hloop
+    rts
+.endproc
+
+; -------------------------------------------------------------
 ; コイン描画 (スロット1-8) ＋ 得点HUD (スロット9)
 ;   各コイン: 画面内X = cx - camera。0..255 に収まる時だけ表示
 ;   未取得かつ画面内のみ表示、それ以外は Y=$FF で隠す
@@ -1176,6 +1330,9 @@ enemy_min_hi: .byte   0,   1,   1
 enemy_max_lo: .byte 150, 104, 219   ; 右端X 下位 (world 150 / 360 / 475)
 enemy_y:      .byte 208, 208, 208
 
+; "CLEAR" の文字タイル並び
+clear_tiles:  .byte TILE_C, TILE_L, TILE_E, TILE_A, TILE_R
+
 ; -------------------------------------------------------------
 ; 割り込みベクタ
 ; -------------------------------------------------------------
@@ -1234,5 +1391,19 @@ enemy_y:      .byte 208, 208, 208
     ; タイル16: 敵 (緑のブロブ=index2 / 目=index3 白)
     .byte $00,$00,$00,$24,$00,$00,$00,$00   ; plane 0 (目だけ → 重なり部が index3)
     .byte $3c,$7e,$ff,$ff,$ff,$ff,$ff,$db   ; plane 1 (体 → index2 緑)
-    ; 残りを 0 で埋めて 8KB に (タイル0..16 = 272byte)
-    .res 8192 - 272, $00
+    ; タイル17: ゴール (金の星 / plane0 のみ = index1 金)
+    .byte $18,$18,$ff,$7e,$3c,$7e,$c3,$00   ; plane 0
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    ; タイル18..22: 文字 'C' 'L' 'E' 'A' 'R' (plane0 のみ = index1)
+    .byte $7c,$c6,$c0,$c0,$c0,$c6,$7c,$00   ; 'C'
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $c0,$c0,$c0,$c0,$c0,$c0,$fe,$00   ; 'L'
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $fe,$c0,$c0,$fc,$c0,$c0,$fe,$00   ; 'E'
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $38,$6c,$c6,$c6,$fe,$c6,$c6,$00   ; 'A'
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $fc,$c6,$c6,$fc,$d8,$cc,$c6,$00   ; 'R'
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    ; 残りを 0 で埋めて 8KB に (タイル0..22 = 368byte)
+    .res 8192 - 368, $00
