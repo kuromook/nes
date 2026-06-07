@@ -94,9 +94,16 @@ CLEAR_PAL  = %00000010   ; スプライトパレット2 (白)
 CLEAR_X    = 108         ; 5文字×8px=40px を画面中央へ
 CLEAR_Y    = 64          ; 空の高い位置 (足場のレンガに重ならないよう)
 
-; ---- パワーアップアイテム (コイン4枚で出現 → 取ると2段ジャンプ) ----
-TILE_ITEM  = 23          ; アイテムの CHR タイル (上向き矢印)
-ITEM_PAL   = %00000010   ; スプライトパレット2 (index2=緑)
+; ---- アイテム (コイン4枚で出現) ----
+;   種別 item_kind: 0=2段ジャンプ / 1=リバース。実装段階につき今は確定で 1。
+;   両種別とも同じスロット/位置/パレット2を使い、タイルだけ切替える
+;     2段ジャンプ → タイル23(緑の上向き矢印 / index2)
+;     リバース    → タイル24(紫の左右矢印  / index3)
+TILE_ITEM    = 23        ; 2段ジャンプアイテムの CHR タイル
+TILE_REVERSE = 24        ; リバースアイテムの CHR タイル
+KIND_DJ      = 0         ; item_kind: 2段ジャンプ
+KIND_REVERSE = 1         ; item_kind: リバース
+ITEM_PAL   = %00000010   ; スプライトパレット2 (index2=緑 / index3=紫)
 ITEM_SLOT  = 104         ; アイテムの OAM オフセット (スロット26 = 26*4)
 ITEM_X     = 256         ; アイテムのワールドX (右画面の左寄り / lo=0,hi=1)
 ITEM_Y     = 168         ; アイテムのY (1段ジャンプで届く高さ)
@@ -155,6 +162,8 @@ has_dj:     .res 1   ; 2段ジャンプ取得フラグ (1=パワーアップ済)
 jumps_left: .res 1   ; 残りジャンプ回数 (接地で 1+has_dj に補充)
 coins_taken:.res 1   ; 取得したコイン総数 (コンボ問わず / アイテム出現判定)
 item_taken: .res 1   ; アイテム取得フラグ (1=取得済)
+item_kind:  .res 1   ; 出現中アイテムの種別 (0=2段ジャンプ / 1=リバース)
+reversed:   .res 1   ; リバース効果 (1=取得順逆転 & コンボ得点2倍)
 
 ; -------------------------------------------------------------
 ; iNES ヘッダ
@@ -266,6 +275,9 @@ forever:
     sta jumps_left     ; ジャンプ残量リセット (空中スタートなので 0)
     sta coins_taken    ; コイン取得数リセット
     sta item_taken     ; アイテム未取得に
+    sta reversed       ; リバース効果オフ (取得順は通常 0→7)
+    lda #KIND_REVERSE  ; アイテム種別=リバース (実装段階につき確定 / 将来ランダム化)
+    sta item_kind
     lda #COIN_MAX      ; コンボ残量を初期化
     sta combo_rem
     ldx #NUM_COINS-1   ; 全コインを「未取得(表示)」に
@@ -660,7 +672,11 @@ forever:
     sta combo_rem
     lda #COIN_MAX
     sec
-    sbc combo_rem
+    sbc combo_rem      ; A = bonus (0..63)
+    ldy reversed
+    beq @add           ; 通常 → 等倍
+    asl a              ; リバース中 → コンボ得点2倍 (bonus*2, 最大126)
+@add:
     clc
     adc score_lo
     sta score_lo
@@ -672,7 +688,10 @@ forever:
     cpx #NUM_COINS
     bne @loop
 
-    ; --- next_coin = 最小の未取得インデックス (点滅 & 順番判定用) ---
+    ; --- next_coin = 次に取るべきコイン (点滅 & 順番判定用) ---
+    ;   通常: 最小の未取得 / リバース中: 最大の未取得。全取得なら NUM_COINS
+    lda reversed
+    bne @find_rev
     ldx #0
 @find:
     lda coin_active, x
@@ -680,7 +699,16 @@ forever:
     inx
     cpx #NUM_COINS
     bne @find
-    ; 全部取った → next_coin = NUM_COINS (該当なし)
+    ; 全部取った → x = NUM_COINS (該当なし)
+    jmp @found
+@find_rev:
+    ldx #NUM_COINS-1
+@frev:
+    lda coin_active, x
+    bne @found          ; 最大側から最初の未取得
+    dex
+    bpl @frev
+    ldx #NUM_COINS      ; 全部取った → NUM_COINS
 @found:
     stx next_coin
     rts
@@ -1034,11 +1062,20 @@ forever:
     adc #7
     cmp #15
     bcs @done
-    ; 取得! 2段ジャンプ解禁
+    ; --- 取得! 種別ごとに効果を適用 ---
     lda #1
     sta item_taken
+    lda item_kind
+    bne @reverse        ; kind=1 → リバース
+    ; kind=0: 2段ジャンプ解禁
+    lda #1
     sta has_dj
     inc jumps_left      ; 取得直後から空中ジャンプ1回ぶん付与
+    rts
+@reverse:
+    ; kind=1: リバース (取得順逆転 & コンボ得点2倍 / next_coin は次フレーム再計算)
+    lda #1
+    sta reversed
 @done:
     rts
 .endproc
@@ -1062,7 +1099,13 @@ forever:
     bne @hide           ; 画面外
     lda #ITEM_Y
     sta OAM+ITEM_SLOT
+    lda item_kind       ; 種別でタイルを選ぶ (色はパレット2で共通)
+    bne @rev_tile
     lda #TILE_ITEM
+    jmp @set_tile
+@rev_tile:
+    lda #TILE_REVERSE
+@set_tile:
     sta OAM+ITEM_SLOT+1
     lda #ITEM_PAL
     sta OAM+ITEM_SLOT+2
@@ -1390,9 +1433,9 @@ palette:
     .byte $22,$07,$17,$30,  $22,$07,$17,$30
     ; スプライトパレット 0=キャラ(赤) / 1=コイン(金) / 2=得点(白)
     ; 3 はトゲ(index1=灰) と 敵(index2=緑) で共有 / index3=白(目)
-    ; パレット2: index1=白(HUD/CLEAR) / index2=緑(アイテム矢印)
+    ; パレット2: index1=白(HUD/CLEAR) / index2=緑(2段ジャンプ) / index3=紫(リバース)
     .byte $0f,$16,$27,$30,  $0f,$28,$27,$30
-    .byte $0f,$30,$2a,$30,  $0f,$10,$2a,$30
+    .byte $0f,$30,$2a,$24,  $0f,$10,$2a,$30
 
 ; -------------------------------------------------------------
 ; 足場テーブル (ワールド・ピクセル座標 / 描画と当たり判定で共用)
@@ -1516,5 +1559,8 @@ clear_tiles:  .byte TILE_C, TILE_L, TILE_E, TILE_A, TILE_R
     ; タイル23: パワーアップ (上向き矢印 / plane1 = index2 緑)
     .byte $00,$00,$00,$00,$00,$00,$00,$00   ; plane 0
     .byte $18,$3c,$7e,$ff,$18,$18,$18,$00   ; plane 1
-    ; 残りを 0 で埋めて 8KB に (タイル0..23 = 384byte)
-    .res 8192 - 384, $00
+    ; タイル24: リバース (左右の双方向矢印 / 両plane=1 → index3 紫)
+    .byte $00,$24,$66,$ff,$66,$24,$00,$00   ; plane 0
+    .byte $00,$24,$66,$ff,$66,$24,$00,$00   ; plane 1
+    ; 残りを 0 で埋めて 8KB に (タイル0..24 = 400byte)
+    .res 8192 - 400, $00
