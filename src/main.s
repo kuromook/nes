@@ -61,6 +61,13 @@ BLINK_MASK = %00001000   ; このビットで狙いのコインを点滅 (8フ�
 ;   ※NESのCPUはBCD無効なので得点は16bit2進で持ち、表示時に10進変換する。
 COIN_MAX   = 64          ; combo_rem の初期値 (= bonus の上限)
 
+; ---- トゲ (障害物) ----
+NUM_SPIKES = 4           ; トゲの本数 (spike_* テーブルと一致させる)
+TILE_SPIKE = 15          ; トゲの CHR タイル番号
+SPIKE_PAL  = %00000011   ; OAM 属性: スプライトパレット3 (灰)
+SPIKE_SLOT0 = 52         ; トゲの OAM 開始オフセット (スロット13 = 13*4)
+;   触れたら即死 → init_game_state で最初から完全リスタート
+
 ; ---- 背景タイル / ステージ ----
 TILE_SKY    = 0    ; 空 (空白タイル)
 TILE_GROUND = 2    ; 地面 (レンガタイル)
@@ -176,8 +183,28 @@ load_palette:
 
     jsr draw_background   ; ネームテーブルにステージを描く (描画OFF中)
 
-    ; キャラ初期位置 (ワールドX=120・空中スタート → 重力で着地)
-    lda #120
+    jsr init_game_state   ; プレイヤー位置・スコア・コンボ・コインを初期化
+
+    lda #$00           ; スクロール初期化
+    sta PPUADDR
+    sta PPUADDR
+
+    lda #%10000000     ; NMI 有効 / パターンテーブルは $0000
+    sta PPUCTRL
+    lda #%00011110     ; 背景 + スプライト 表示 ON
+    sta PPUMASK
+
+forever:
+    jmp forever
+.endproc
+
+; -------------------------------------------------------------
+; ゲーム状態の初期化 (起動時 & 死亡時の完全リスタートで共用)
+;   プレイヤーを初期位置(空中)へ / スコア・コンボ・コインを初期状態へ
+;   ※背景/パレットは不変なので触らない (描画ON中に呼んでも安全)
+; -------------------------------------------------------------
+.proc init_game_state
+    lda #120           ; キャラ初期位置 (ワールドX=120・空中→落下)
     sta px_lo
     lda #0
     sta px_hi
@@ -192,28 +219,15 @@ load_palette:
     sta score_lo       ; 得点 0
     sta score_hi
     sta next_coin      ; 最初に取るコイン = 0番
-    sta frame_cnt
     lda #COIN_MAX      ; コンボ残量を初期化
     sta combo_rem
-
     ldx #NUM_COINS-1   ; 全コインを「未取得(表示)」に
     lda #1
 @init_coins:
     sta coin_active, x
     dex
     bpl @init_coins
-
-    lda #$00           ; スクロール初期化
-    sta PPUADDR
-    sta PPUADDR
-
-    lda #%10000000     ; NMI 有効 / パターンテーブルは $0000
-    sta PPUCTRL
-    lda #%00011110     ; 背景 + スプライト 表示 ON
-    sta PPUMASK
-
-forever:
-    jmp forever
+    rts
 .endproc
 
 ; -------------------------------------------------------------
@@ -230,8 +244,9 @@ forever:
 
     jsr read_controller
     jsr move_player
-    jsr update_camera  ; camera_lo/hi と screen_x を計算
-    jsr update_coins   ; コイン取得判定 (順番制) → 得点加算
+    jsr update_coins   ; コイン取得判定 → 得点加算 (ワールド座標, カメラ不要)
+    jsr check_spikes   ; トゲ当たり判定 → 触れたら最初からリスタート
+    jsr update_camera  ; camera_lo/hi と screen_x を計算 (リスタート後の位置も反映)
 
     ; スプライト0 (キャラ) を OAM バッファへ書き込み
     lda player_y
@@ -239,7 +254,8 @@ forever:
     lda screen_x
     sta OAM+3          ; 画面内X 座標
     jsr animate        ; OAM+1(タイル) と OAM+2(属性=向き) をセット
-    jsr draw_coins     ; コイン(スロット1-8) と 得点HUD(スロット9) を描画
+    jsr draw_coins     ; コイン(スロット1-8) と 得点HUD(スロット9-12) を描画
+    jsr draw_spikes    ; トゲ(スロット13-16) を描画
 
     ; OAM DMA: $0200-$02FF を PPU の OAM へ一括転送
     lda #$00
@@ -619,6 +635,86 @@ forever:
 .endproc
 
 ; -------------------------------------------------------------
+; トゲ当たり判定: プレイヤーがどれかのトゲに重なったら即死→完全リスタート
+;   重なり条件はコインと同じ (|px-sx|<=7 かつ |player_y-sy|<=7)
+; -------------------------------------------------------------
+.proc check_spikes
+    ldx #0
+@loop:
+    ; X 重なり: dx = px - sx (16bit)、dx+7 が [0,14] か
+    sec
+    lda px_lo
+    sbc spike_x_lo, x
+    sta tmp_lo
+    lda px_hi
+    sbc spike_x_hi, x
+    sta tmp_hi
+    clc
+    lda tmp_lo
+    adc #7
+    sta tmp_lo
+    lda tmp_hi
+    adc #0
+    bne @next
+    lda tmp_lo
+    cmp #15
+    bcs @next
+    ; Y 重なり: dy = player_y - sy、dy+7 が [0,14] か
+    lda player_y
+    sec
+    sbc spike_y, x
+    clc
+    adc #7
+    cmp #15
+    bcs @next
+    ; 衝突! 死亡 → 最初から完全リスタート
+    jsr init_game_state
+    rts
+@next:
+    inx
+    cpx #NUM_SPIKES
+    bne @loop
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; トゲ描画 (スロット13-16): 画面内X = sx - camera。画面外は Y=$FF で隠す
+; -------------------------------------------------------------
+.proc draw_spikes
+    ldx #0
+    ldy #SPIKE_SLOT0
+@loop:
+    sec
+    lda spike_x_lo, x
+    sbc camera_lo
+    sta tmp_lo
+    lda spike_x_hi, x
+    sbc camera_hi
+    bne @hide           ; 画面外
+    lda spike_y, x
+    sta OAM, y
+    lda #TILE_SPIKE
+    sta OAM+1, y
+    lda #SPIKE_PAL
+    sta OAM+2, y
+    lda tmp_lo
+    sta OAM+3, y
+    jmp @next
+@hide:
+    lda #$ff
+    sta OAM, y
+@next:
+    iny
+    iny
+    iny
+    iny
+    inx
+    cpx #NUM_SPIKES
+    bne @loop
+    rts
+.endproc
+
+; -------------------------------------------------------------
 ; コイン描画 (スロット1-8) ＋ 得点HUD (スロット9)
 ;   各コイン: 画面内X = cx - camera。0..255 に収まる時だけ表示
 ;   未取得かつ画面内のみ表示、それ以外は Y=$FF で隠す
@@ -884,9 +980,9 @@ palette:
     ; 背景パレット0: $3F00=空の青(backdrop) / 1=レンガ茶 / 2=明茶 / 3=目地の白
     .byte $22,$07,$17,$30,  $22,$07,$17,$30
     .byte $22,$07,$17,$30,  $22,$07,$17,$30
-    ; スプライトパレット 0=キャラ(赤) / 1=コイン(金) / 2=得点(白) / 3=予備
+    ; スプライトパレット 0=キャラ(赤) / 1=コイン(金) / 2=得点(白) / 3=トゲ(灰)
     .byte $0f,$16,$27,$30,  $0f,$28,$27,$30
-    .byte $0f,$30,$30,$30,  $0f,$14,$24,$30
+    .byte $0f,$30,$30,$30,  $0f,$10,$00,$30
 
 ; -------------------------------------------------------------
 ; 足場テーブル (ワールド・ピクセル座標 / 描画と当たり判定で共用)
@@ -912,6 +1008,15 @@ coin_y:      .byte 204, 164, 132, 100, 132, 100, 148, 204
 ; 10進変換用の桁の重み (上位桁から / HUD_DIGITS-1 個)
 pow10_lo:    .byte <1000, <100, <10
 pow10_hi:    .byte >1000, >100, >10
+
+; -------------------------------------------------------------
+; トゲテーブル (ワールド・ピクセル座標 / 8x8)
+;   地面(y=FLOOR_Y=208)に配置。コインの x とは重ならない位置にする
+;   触れると即死。ジャンプで飛び越える
+; -------------------------------------------------------------
+spike_x_lo:  .byte 160, 240,  80, 160   ; (x_hi=1 側は 256+80=336, 256+160=416)
+spike_x_hi:  .byte   0,   0,   1,   1
+spike_y:     .byte 208, 208, 208, 208
 
 ; -------------------------------------------------------------
 ; 割り込みベクタ
@@ -965,5 +1070,8 @@ pow10_hi:    .byte >1000, >100, >10
     .byte $00,$00,$00,$00,$00,$00,$00,$00
     .byte $7c,$c6,$c6,$7e,$06,$0c,$78,$00   ; '9'
     .byte $00,$00,$00,$00,$00,$00,$00,$00
-    ; 残りを 0 で埋めて 8KB に (タイル0..14 = 240byte)
-    .res 8192 - 240, $00
+    ; タイル15: トゲ (上向きの三角 / index1 灰)
+    .byte $18,$18,$3c,$3c,$7e,$7e,$ff,$ff   ; plane 0
+    .byte $00,$00,$00,$00,$00,$00,$00,$00   ; plane 1
+    ; 残りを 0 で埋めて 8KB に (タイル0..15 = 256byte)
+    .res 8192 - 256, $00
