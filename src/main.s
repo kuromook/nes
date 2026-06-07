@@ -164,6 +164,7 @@ coins_taken:.res 1   ; 取得したコイン総数 (コンボ問わず / アイ�
 item_taken: .res 1   ; アイテム取得フラグ (1=取得済)
 item_kind:  .res 1   ; 出現中アイテムの種別 (0=2段ジャンプ / 1=リバース)
 reversed:   .res 1   ; リバース効果 (1=取得順逆転 & コンボ得点2倍)
+rng:        .res 1   ; 疑似乱数 (8bit LFSR / 毎フレーム更新 / アイテム抽選用)
 
 ; -------------------------------------------------------------
 ; iNES ヘッダ
@@ -234,6 +235,9 @@ load_palette:
 
     jsr draw_background   ; ネームテーブルにステージを描く (描画OFF中)
 
+    lda #$a5              ; 乱数LFSRの初期seed (非ゼロ必須 / 死亡しても維持)
+    sta rng
+
     jsr init_game_state   ; プレイヤー位置・スコア・コンボ・コインを初期化
 
     lda #$00           ; スクロール初期化
@@ -276,8 +280,7 @@ forever:
     sta coins_taken    ; コイン取得数リセット
     sta item_taken     ; アイテム未取得に
     sta reversed       ; リバース効果オフ (取得順は通常 0→7)
-    lda #KIND_REVERSE  ; アイテム種別=リバース (実装段階につき確定 / 将来ランダム化)
-    sta item_kind
+    sta item_kind      ; 種別は仮で0 (4枚目取得時に rng で抽選し上書き)
     lda #COIN_MAX      ; コンボ残量を初期化
     sta combo_rem
     ldx #NUM_COINS-1   ; 全コインを「未取得(表示)」に
@@ -311,6 +314,7 @@ forever:
     pha
 
     inc frame_cnt      ; 点滅などの周期カウンタ
+    jsr update_rng     ; 乱数LFSRを1ステップ進める (アイテム抽選用)
 
     jsr read_controller
 
@@ -657,6 +661,13 @@ forever:
     lda #0
     sta coin_active, x
     inc coins_taken     ; 取得総数 +1 (アイテム出現判定用 / コンボ無関係)
+    lda coins_taken     ; 4枚目ちょうどなら出現アイテムを抽選
+    cmp #ITEM_COINS
+    bne @no_lottery
+    lda rng             ; bit0 で 2段ジャンプ(0) / リバース(1) を決定
+    and #1
+    sta item_kind
+@no_lottery:
     cpx next_coin
     beq @score          ; 順番どおり → コンボ継続
     lda #COIN_MAX       ; 順番外 → コンボリセット (次の加点は 32)
@@ -1401,6 +1412,20 @@ forever:
     iny
     jmp @ploop
 @done:
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; 疑似乱数: 8bit Galois LFSR (多項式 x^8+x^4+x^3+x^2+1 = $1D)
+;   毎フレーム1ステップ進める。seed が非ゼロなら周期255で巡回する
+; -------------------------------------------------------------
+.proc update_rng
+    lda rng
+    asl a
+    bcc @no_fb
+    eor #$1d           ; bit7 が出たらタップでフィードバック
+@no_fb:
+    sta rng
     rts
 .endproc
 
