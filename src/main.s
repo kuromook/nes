@@ -43,6 +43,24 @@ FLOOR_Y  = 208     ; 地面の上に立つ Y (地面 row27=y216, スプライト
 ; ---- 足場 (プラットフォーム) ----
 NUM_PLATFORMS = 6  ; 足場の枚数 (plat_* テーブルと一致させる)
 
+; ---- コイン / 得点 ----
+NUM_COINS  = 8           ; コインの枚数 (coin_* テーブルと一致させる)
+TILE_COIN  = 4           ; コインの CHR タイル番号
+DIGIT_BASE = 5           ; 数字 '0'..'9' = タイル 5..14
+COIN_PAL   = %00000001   ; OAM 属性: スプライトパレット1 (金)
+SCORE_PAL  = %00000010   ; OAM 属性: スプライトパレット2 (白)
+COIN_SLOT0 = 4           ; コインの OAM 開始オフセット (スロット1 = 4)
+SCORE_SLOT = 36          ; 得点HUD の OAM 開始オフセット (スロット9 = 9*4)
+HUD_DIGITS = 4           ; 得点の表示桁数
+HUD_X      = 16          ; 得点表示の画面内X (左端の桁)
+HUD_Y      = 16          ; 得点表示の画面内Y
+BLINK_MASK = %00001000   ; このビットで狙いのコインを点滅 (8フレーム周期)
+; ---- コンボ加点 (方法A) ----
+;   コイン取得ごとに combo_rem を半減 → bonus = COIN_MAX - combo_rem を加算。
+;   取り続けるほど combo_rem が小さくなり bonus が COIN_MAX に近づく (= 加点増)。
+;   ※NESのCPUはBCD無効なので得点は16bit2進で持ち、表示時に10進変換する。
+COIN_MAX   = 64          ; combo_rem の初期値 (= bonus の上限)
+
 ; ---- 背景タイル / ステージ ----
 TILE_SKY    = 0    ; 空 (空白タイル)
 TILE_GROUND = 2    ; 地面 (レンガタイル)
@@ -79,6 +97,15 @@ screen_x:  .res 1   ; キャラの画面内X (= px - camera, OAM へ渡す)
 bg_tile:   .res 1   ; 背景描画ループの一時タイル番号
 ptr_lo:    .res 1   ; 汎用ポインタ下位 (描画/当たり判定の一時計算用)
 ptr_hi:    .res 1   ; 汎用ポインタ上位
+tmp_lo:    .res 1   ; 汎用一時 下位 (コイン判定/描画の計算用)
+tmp_hi:    .res 1   ; 汎用一時 上位
+score_lo:  .res 1   ; 得点 (16bit 2進) 下位
+score_hi:  .res 1   ; 得点 (16bit 2進) 上位
+combo_rem: .res 1   ; コンボ残量 (方法A: 取得ごと半減 / MAXとの差がボーナス)
+next_coin: .res 1   ; 次に取るべきコイン番号 (0..8 / 順番制)
+frame_cnt: .res 1   ; NMI ごとに +1 (点滅などの周期用)
+coin_active: .res NUM_COINS ; コイン表示フラグ (1=未取得/表示, 0=取得済)
+score_dec: .res HUD_DIGITS  ; 得点の10進各桁 (表示用 / bin2dec の出力)
 
 ; -------------------------------------------------------------
 ; iNES ヘッダ
@@ -162,6 +189,19 @@ load_palette:
     sta vy_hi
     sta on_ground
     sta pad1_prev
+    sta score_lo       ; 得点 0
+    sta score_hi
+    sta next_coin      ; 最初に取るコイン = 0番
+    sta frame_cnt
+    lda #COIN_MAX      ; コンボ残量を初期化
+    sta combo_rem
+
+    ldx #NUM_COINS-1   ; 全コインを「未取得(表示)」に
+    lda #1
+@init_coins:
+    sta coin_active, x
+    dex
+    bpl @init_coins
 
     lda #$00           ; スクロール初期化
     sta PPUADDR
@@ -186,9 +226,12 @@ forever:
     tya
     pha
 
+    inc frame_cnt      ; 点滅などの周期カウンタ
+
     jsr read_controller
     jsr move_player
     jsr update_camera  ; camera_lo/hi と screen_x を計算
+    jsr update_coins   ; コイン取得判定 (順番制) → 得点加算
 
     ; スプライト0 (キャラ) を OAM バッファへ書き込み
     lda player_y
@@ -196,6 +239,7 @@ forever:
     lda screen_x
     sta OAM+3          ; 画面内X 座標
     jsr animate        ; OAM+1(タイル) と OAM+2(属性=向き) をセット
+    jsr draw_coins     ; コイン(スロット1-8) と 得点HUD(スロット9) を描画
 
     ; OAM DMA: $0200-$02FF を PPU の OAM へ一括転送
     lda #$00
@@ -477,6 +521,194 @@ forever:
 .endproc
 
 ; -------------------------------------------------------------
+; コイン取得判定: 「次に取るべき」コイン(next_coin)だけを対象にする
+;   = 順番どおりに取らないと得点にならない (順番制)
+;   プレイヤー(px,player_y) と コイン(cx,cy) が 8x8 で重なれば取得
+;   重なり条件: |px - cx| <= 7 かつ |player_y - cy| <= 7
+;   ※判定にカメラは不要 (すべてワールド座標で比較)
+; -------------------------------------------------------------
+.proc update_coins
+    ldx next_coin
+    cpx #NUM_COINS
+    bcs @done           ; 全部取り終えた
+    lda coin_active, x
+    beq @done           ; 念のため (取得済なら何もしない)
+
+    ; --- X 重なり: dx = px - cx (16bit)、dx+7 が [0,14] なら重なり ---
+    sec
+    lda px_lo
+    sbc coin_x_lo, x
+    sta tmp_lo
+    lda px_hi
+    sbc coin_x_hi, x
+    sta tmp_hi
+    clc
+    lda tmp_lo
+    adc #7
+    sta tmp_lo
+    lda tmp_hi
+    adc #0
+    bne @done           ; 上位が 0 でない → 範囲外
+    lda tmp_lo
+    cmp #15
+    bcs @done           ; >=15 → 重ならない
+
+    ; --- Y 重なり: dy = player_y - cy (8bit)、dy+7 が [0,14] なら重なり ---
+    lda player_y
+    sec
+    sbc coin_y, x
+    clc
+    adc #7
+    cmp #15
+    bcs @done
+
+    ; --- 取得! コンボ加点 (方法A) ---
+    lda #0
+    sta coin_active, x
+    ; combo_rem -= combo_rem >> 1
+    lda combo_rem
+    lsr a
+    sta tmp_lo
+    lda combo_rem
+    sec
+    sbc tmp_lo
+    sta combo_rem
+    ; bonus = COIN_MAX - combo_rem
+    lda #COIN_MAX
+    sec
+    sbc combo_rem
+    ; score (16bit) += bonus
+    clc
+    adc score_lo
+    sta score_lo
+    lda score_hi
+    adc #0
+    sta score_hi
+    inc next_coin
+@done:
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; コイン描画 (スロット1-8) ＋ 得点HUD (スロット9)
+;   各コイン: 画面内X = cx - camera。0..255 に収まる時だけ表示
+;   未取得かつ画面内のみ表示、それ以外は Y=$FF で隠す
+;   「次に取る」コインは点滅させて目印にする
+;   得点HUD はスクロール非依存 (画面左上に固定の数字スプライト)
+; -------------------------------------------------------------
+.proc draw_coins
+    ldx #0              ; コイン番号 0..7
+    ldy #COIN_SLOT0     ; OAM オフセット (スロット1 から)
+@loop:
+    lda coin_active, x
+    beq @hide           ; 取得済 → 隠す
+
+    ; 画面内X = cx - camera (16bit)。上位が 0 でなければ画面外
+    sec
+    lda coin_x_lo, x
+    sbc camera_lo
+    sta tmp_lo
+    lda coin_x_hi, x
+    sbc camera_hi
+    bne @hide           ; 左に出た($ff) / 右に出た(>=1) → 画面外
+
+    ; 次に取るコインは点滅 (BLINK_MASK ビットが立つフレームは隠す)
+    cpx next_coin
+    bne @show
+    lda frame_cnt
+    and #BLINK_MASK
+    bne @hide
+@show:
+    lda coin_y, x
+    sta OAM, y
+    lda #TILE_COIN
+    sta OAM+1, y
+    lda #COIN_PAL
+    sta OAM+2, y
+    lda tmp_lo          ; 画面内X
+    sta OAM+3, y
+    jmp @next
+@hide:
+    lda #$ff
+    sta OAM, y          ; Y=$FF で画面外に隠す
+@next:
+    iny
+    iny
+    iny
+    iny
+    inx
+    cpx #NUM_COINS
+    bne @loop
+
+    ; --- 得点HUD: 画面左上に HUD_DIGITS 桁 (2進→10進変換して表示) ---
+    jsr bin2dec        ; score_lo/hi → score_dec[0..HUD_DIGITS-1]
+    ldx #0             ; 桁番号 (0 = 最上位)
+@hud:
+    txa                ; OAM オフセット = SCORE_SLOT + 桁*4
+    asl a
+    asl a
+    clc
+    adc #SCORE_SLOT
+    tay
+    lda #HUD_Y
+    sta OAM, y
+    lda score_dec, x   ; 数字 → タイル
+    clc
+    adc #DIGIT_BASE
+    sta OAM+1, y
+    lda #SCORE_PAL
+    sta OAM+2, y
+    txa                ; 画面内X = HUD_X + 桁*8
+    asl a
+    asl a
+    asl a
+    clc
+    adc #HUD_X
+    sta OAM+3, y
+    inx
+    cpx #HUD_DIGITS
+    bne @hud
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; 2進→10進: score_lo/hi (16bit) を score_dec[] の各桁に分解
+;   桁の重み (1000,100,10) を順に引き算して商=桁、最後の余り=1の位
+;   ※NESのCPUはBCD無効のため、表示用にソフトで10進変換する
+; -------------------------------------------------------------
+.proc bin2dec
+    lda score_lo
+    sta tmp_lo
+    lda score_hi
+    sta tmp_hi
+    ldx #0             ; 重みテーブルの添字 (0=1000,1=100,2=10)
+@digit:
+    ldy #0             ; この桁の値 (引けた回数)
+@sub:
+    sec
+    lda tmp_lo
+    sbc pow10_lo, x
+    sta ptr_lo         ; 試し引きの下位を退避
+    lda tmp_hi
+    sbc pow10_hi, x
+    bcc @next          ; 借り発生 → これ以上引けない
+    sta tmp_hi
+    lda ptr_lo
+    sta tmp_lo
+    iny
+    jmp @sub
+@next:
+    tya
+    sta score_dec, x
+    inx
+    cpx #HUD_DIGITS-1
+    bne @digit
+    lda tmp_lo         ; 残り = 1の位 (0..9)
+    sta score_dec + HUD_DIGITS-1
+    rts
+.endproc
+
+; -------------------------------------------------------------
 ; 背景描画: ネームテーブル2枚 ($2000/$2400) にステージを描く
 ;   = 512px幅のワールド。各画面: 上27行=空 / 下3行=地面、属性=全0
 ;   ※ 描画OFF中に呼ぶこと
@@ -623,9 +855,9 @@ palette:
     ; 背景パレット0: $3F00=空の青(backdrop) / 1=レンガ茶 / 2=明茶 / 3=目地の白
     .byte $22,$07,$17,$30,  $22,$07,$17,$30
     .byte $22,$07,$17,$30,  $22,$07,$17,$30
-    ; スプライトパレット
-    .byte $0f,$16,$27,$30,  $0f,$1a,$2a,$30
-    .byte $0f,$12,$22,$30,  $0f,$14,$24,$30
+    ; スプライトパレット 0=キャラ(赤) / 1=コイン(金) / 2=得点(白) / 3=予備
+    .byte $0f,$16,$27,$30,  $0f,$28,$27,$30
+    .byte $0f,$30,$30,$30,  $0f,$14,$24,$30
 
 ; -------------------------------------------------------------
 ; 足場テーブル (ワールド・ピクセル座標 / 描画と当たり判定で共用)
@@ -637,6 +869,20 @@ plat_x0_lo:  .byte  32,  96, 176,  24, 104, 184
 plat_x0_hi:  .byte   0,   0,   0,   1,   1,   1
 plat_x1_lo:  .byte  64, 136, 216,  64, 144, 224
 plat_x1_hi:  .byte   0,   0,   0,   1,   1,   1
+
+; -------------------------------------------------------------
+; コインテーブル (ワールド・ピクセル座標 / 8x8)
+;   取る順番 = この並び順 (0→7)。左地面→左の足場3枚→右の足場3枚→右地面
+;   x は 16bit (hi=0 左画面 / hi=1 右画面)。y は各足場の少し上に浮かせる
+;   coin_active(RAM) で取得状態を管理。座標は定数なので RODATA に置く
+; -------------------------------------------------------------
+coin_x_lo:   .byte  24,  44, 112, 192,  40, 120, 200, 224
+coin_x_hi:   .byte   0,   0,   0,   0,   1,   1,   1,   1
+coin_y:      .byte 204, 164, 132, 100, 132, 100, 148, 204
+
+; 10進変換用の桁の重み (上位桁から / HUD_DIGITS-1 個)
+pow10_lo:    .byte <1000, <100, <10
+pow10_hi:    .byte >1000, >100, >10
 
 ; -------------------------------------------------------------
 ; 割り込みベクタ
@@ -666,5 +912,29 @@ plat_x1_hi:  .byte   0,   0,   0,   1,   1,   1
     ; タイル3: キャラ 歩行フレームB (足の位置だけ違う)
     .byte $3c,$7e,$ff,$ff,$ff,$ff,$66,$43   ; plane 0
     .byte $00,$00,$00,$04,$00,$00,$00,$00   ; plane 1 (目 index3 のみ)
-    ; 残りを 0 で埋めて 8KB に (タイル0..3 = 64byte)
-    .res 8192 - 64, $00
+    ; タイル4: コイン (body=index1 金 / 中央の縦線=index3 白)
+    .byte $3c,$7e,$ff,$ff,$ff,$ff,$7e,$3c   ; plane 0 (丸い輪郭)
+    .byte $00,$00,$18,$18,$18,$18,$00,$00   ; plane 1 (中央の光沢ライン)
+    ; タイル5..14: 数字 '0'..'9' (plane0 のみ = index1)
+    .byte $7c,$c6,$ce,$de,$f6,$e6,$7c,$00   ; '0'
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $30,$70,$30,$30,$30,$30,$fc,$00   ; '1'
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $7c,$c6,$06,$1c,$70,$c0,$fe,$00   ; '2'
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $7c,$c6,$06,$3c,$06,$c6,$7c,$00   ; '3'
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $1c,$3c,$6c,$cc,$fe,$0c,$0c,$00   ; '4'
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $fe,$c0,$fc,$06,$06,$c6,$7c,$00   ; '5'
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $3c,$60,$c0,$fc,$c6,$c6,$7c,$00   ; '6'
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $fe,$06,$0c,$18,$30,$30,$30,$00   ; '7'
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $7c,$c6,$c6,$7c,$c6,$c6,$7c,$00   ; '8'
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $7c,$c6,$c6,$7e,$06,$0c,$78,$00   ; '9'
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    ; 残りを 0 で埋めて 8KB に (タイル0..14 = 240byte)
+    .res 8192 - 240, $00

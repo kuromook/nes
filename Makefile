@@ -6,6 +6,9 @@ OBJ     := $(SRC:.s=.o)
 ROM     := $(NAME).nes
 
 EMU     := fceux        # 動作確認用エミュレータ
+# このマシンの Mesa ハードウェアGLは FCEUX で入力時にクラッシュ(画面が真っ黒で固まる)するため
+# ソフトウェア描画を強制する。直ったらこの行は外してよい。
+EMU_ENV := LIBGL_ALWAYS_SOFTWARE=1
 
 .PHONY: all run clean
 
@@ -20,7 +23,7 @@ $(ROM): $(OBJ) $(CFG)
 
 # ビルドして実行
 run: $(ROM)
-	$(EMU) $(ROM)
+	$(EMU_ENV) $(EMU) $(ROM)
 
 clean:
 	rm -f $(OBJ) $(ROM)
