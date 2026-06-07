@@ -94,6 +94,14 @@ CLEAR_PAL  = %00000010   ; スプライトパレット2 (白)
 CLEAR_X    = 108         ; 5文字×8px=40px を画面中央へ
 CLEAR_Y    = 64          ; 空の高い位置 (足場のレンガに重ならないよう)
 
+; ---- パワーアップアイテム (コイン4枚で出現 → 取ると2段ジャンプ) ----
+TILE_ITEM  = 23          ; アイテムの CHR タイル (上向き矢印)
+ITEM_PAL   = %00000010   ; スプライトパレット2 (index2=緑)
+ITEM_SLOT  = 104         ; アイテムの OAM オフセット (スロット26 = 26*4)
+ITEM_X     = 256         ; アイテムのワールドX (右画面の左寄り / lo=0,hi=1)
+ITEM_Y     = 168         ; アイテムのY (1段ジャンプで届く高さ)
+ITEM_COINS = 4           ; 出現に必要なコイン取得数 (コンボ問わず合計)
+
 ; ---- 背景タイル / ステージ ----
 TILE_SKY    = 0    ; 空 (空白タイル)
 TILE_GROUND = 2    ; 地面 (レンガタイル)
@@ -143,6 +151,10 @@ enemy_x_lo: .res NUM_ENEMIES ; 敵の現在X 下位 (RAM)
 enemy_x_hi: .res NUM_ENEMIES ; 敵の現在X 上位 (画面内patrolなので不変)
 enemy_dir:  .res NUM_ENEMIES ; 敵の進行方向 (0=右 / 1=左)
 cleared:    .res 1   ; ステージクリア状態 (0=プレイ中 / 1=クリア)
+has_dj:     .res 1   ; 2段ジャンプ取得フラグ (1=パワーアップ済)
+jumps_left: .res 1   ; 残りジャンプ回数 (接地で 1+has_dj に補充)
+coins_taken:.res 1   ; 取得したコイン総数 (コンボ問わず / アイテム出現判定)
+item_taken: .res 1   ; アイテム取得フラグ (1=取得済)
 
 ; -------------------------------------------------------------
 ; iNES ヘッダ
@@ -250,6 +262,10 @@ forever:
     sta score_hi
     sta next_coin      ; 最初に取るコイン = 0番
     sta cleared        ; クリア状態を解除
+    sta has_dj         ; パワーアップ解除 (2段ジャンプ不可)
+    sta jumps_left     ; ジャンプ残量リセット (空中スタートなので 0)
+    sta coins_taken    ; コイン取得数リセット
+    sta item_taken     ; アイテム未取得に
     lda #COIN_MAX      ; コンボ残量を初期化
     sta combo_rem
     ldx #NUM_COINS-1   ; 全コインを「未取得(表示)」に
@@ -292,6 +308,7 @@ forever:
     ; --- プレイ中: ゲーム更新 ---
     jsr move_player
     jsr update_coins   ; コイン取得判定 → 得点加算 (ワールド座標, カメラ不要)
+    jsr update_item    ; アイテム取得判定 (コイン4枚で出現 → 2段ジャンプ)
     jsr update_enemies ; 敵を左右に動かす
     jsr check_spikes   ; トゲ当たり判定 → 触れたら最初からリスタート
     jsr check_enemies  ; 敵当たり判定 → 触れたら最初からリスタート
@@ -317,6 +334,7 @@ forever:
     jsr draw_spikes    ; トゲ(スロット13-16) を描画
     jsr draw_enemies   ; 敵(スロット17-19) を描画
     jsr draw_goal      ; ゴール(スロット20) を描画 (全コイン取得後のみ)
+    jsr draw_item      ; アイテム(スロット26) を描画 (コイン4枚〜取得まで)
     jsr draw_clear     ; "CLEAR"(スロット21-25) を描画 (cleared 時のみ)
 
     ; OAM DMA: $0200-$02FF を PPU の OAM へ一括転送
@@ -402,14 +420,16 @@ forever:
     sta px_hi
 @no_right:
 
-    ; --- ジャンプ (A を押した瞬間 & 接地時のみ) ---
+    ; --- ジャンプ (A押下の瞬間 / jumps_left が残っていれば空中でも) ---
+    ;   接地で jumps_left = 1+has_dj に補充。パワーアップ(has_dj)取得で2段ジャンプ可
     lda pad1_prev
     eor #$ff
     and pad1            ; このフレーム新たに押されたボタン
     and #BTN_A
     beq @no_jump
-    lda on_ground
-    beq @no_jump
+    lda jumps_left
+    beq @no_jump        ; 残ジャンプ無し → 跳べない
+    dec jumps_left
     lda #<JUMP_VEL      ; 上向き初速をセット
     sta vy_lo
     lda #>JUMP_VEL
@@ -493,6 +513,10 @@ forever:
     sta vy_hi
     lda #1
     sta on_ground
+    lda has_dj         ; 接地でジャンプ補充 (通常1 / パワーアップ時2)
+    clc
+    adc #1
+    sta jumps_left
     jmp @save_pad
 @pnext:
     dey
@@ -511,6 +535,10 @@ forever:
     sta vy_hi
     lda #1
     sta on_ground
+    lda has_dj         ; 接地でジャンプ補充 (通常1 / パワーアップ時2)
+    clc
+    adc #1
+    sta jumps_left
     jmp @save_pad
 @airborne:
     lda #0
@@ -616,6 +644,7 @@ forever:
     ; --- 取得! ---
     lda #0
     sta coin_active, x
+    inc coins_taken     ; 取得総数 +1 (アイテム出現判定用 / コンボ無関係)
     cpx next_coin
     beq @score          ; 順番どおり → コンボ継続
     lda #COIN_MAX       ; 順番外 → コンボリセット (次の加点は 32)
@@ -969,6 +998,84 @@ forever:
 .endproc
 
 ; -------------------------------------------------------------
+; パワーアップアイテム判定: コインを4枚取ると出現。触れると2段ジャンプ取得
+;   出現条件: coins_taken >= ITEM_COINS かつ item_taken==0
+;   重なり条件はコイン等と同じ (|px-ITEM_X|<=7 かつ |player_y-ITEM_Y|<=7)
+; -------------------------------------------------------------
+.proc update_item
+    lda item_taken
+    bne @done           ; もう取得済
+    lda coins_taken
+    cmp #ITEM_COINS
+    bcc @done           ; まだ4枚取ってない → 未出現
+    ; X 重なり: dx = px - ITEM_X (16bit)、dx+7 が [0,14] か
+    sec
+    lda px_lo
+    sbc #<ITEM_X
+    sta tmp_lo
+    lda px_hi
+    sbc #>ITEM_X
+    sta tmp_hi
+    clc
+    lda tmp_lo
+    adc #7
+    sta tmp_lo
+    lda tmp_hi
+    adc #0
+    bne @done
+    lda tmp_lo
+    cmp #15
+    bcs @done
+    ; Y 重なり: dy = player_y - ITEM_Y、dy+7 が [0,14] か
+    lda player_y
+    sec
+    sbc #ITEM_Y
+    clc
+    adc #7
+    cmp #15
+    bcs @done
+    ; 取得! 2段ジャンプ解禁
+    lda #1
+    sta item_taken
+    sta has_dj
+    inc jumps_left      ; 取得直後から空中ジャンプ1回ぶん付与
+@done:
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; アイテム描画 (スロット26): 出現中(4枚取得・未取得)かつ画面内のみ表示
+; -------------------------------------------------------------
+.proc draw_item
+    lda item_taken
+    bne @hide
+    lda coins_taken
+    cmp #ITEM_COINS
+    bcc @hide           ; 未出現
+    ; 画面内X = ITEM_X - camera
+    sec
+    lda #<ITEM_X
+    sbc camera_lo
+    sta tmp_lo
+    lda #>ITEM_X
+    sbc camera_hi
+    bne @hide           ; 画面外
+    lda #ITEM_Y
+    sta OAM+ITEM_SLOT
+    lda #TILE_ITEM
+    sta OAM+ITEM_SLOT+1
+    lda #ITEM_PAL
+    sta OAM+ITEM_SLOT+2
+    lda tmp_lo
+    sta OAM+ITEM_SLOT+3
+    rts
+@hide:
+    lda #$ff
+    sta OAM+ITEM_SLOT
+    rts
+.endproc
+
+; -------------------------------------------------------------
 ; "CLEAR" 描画 (スロット21-25): cleared 時のみ画面中央に表示
 ; -------------------------------------------------------------
 .proc draw_clear
@@ -1283,8 +1390,9 @@ palette:
     .byte $22,$07,$17,$30,  $22,$07,$17,$30
     ; スプライトパレット 0=キャラ(赤) / 1=コイン(金) / 2=得点(白)
     ; 3 はトゲ(index1=灰) と 敵(index2=緑) で共有 / index3=白(目)
+    ; パレット2: index1=白(HUD/CLEAR) / index2=緑(アイテム矢印)
     .byte $0f,$16,$27,$30,  $0f,$28,$27,$30
-    .byte $0f,$30,$30,$30,  $0f,$10,$2a,$30
+    .byte $0f,$30,$2a,$30,  $0f,$10,$2a,$30
 
 ; -------------------------------------------------------------
 ; 足場テーブル (ワールド・ピクセル座標 / 描画と当たり判定で共用)
@@ -1405,5 +1513,8 @@ clear_tiles:  .byte TILE_C, TILE_L, TILE_E, TILE_A, TILE_R
     .byte $00,$00,$00,$00,$00,$00,$00,$00
     .byte $fc,$c6,$c6,$fc,$d8,$cc,$c6,$00   ; 'R'
     .byte $00,$00,$00,$00,$00,$00,$00,$00
-    ; 残りを 0 で埋めて 8KB に (タイル0..22 = 368byte)
-    .res 8192 - 368, $00
+    ; タイル23: パワーアップ (上向き矢印 / plane1 = index2 緑)
+    .byte $00,$00,$00,$00,$00,$00,$00,$00   ; plane 0
+    .byte $18,$3c,$7e,$ff,$18,$18,$18,$00   ; plane 1
+    ; 残りを 0 で埋めて 8KB に (タイル0..23 = 384byte)
+    .res 8192 - 384, $00
