@@ -521,20 +521,71 @@ forever:
 .endproc
 
 ; -------------------------------------------------------------
-; コイン取得判定: 「次に取るべき」コイン(next_coin)だけを対象にする
-;   = 順番どおりに取らないと得点にならない (順番制)
-;   プレイヤー(px,player_y) と コイン(cx,cy) が 8x8 で重なれば取得
-;   重なり条件: |px - cx| <= 7 かつ |player_y - cy| <= 7
-;   ※判定にカメラは不要 (すべてワールド座標で比較)
+; コイン取得判定: どのコインも触れたら取れる
+;   重なり条件: |px - cx| <= 7 かつ |player_y - cy| <= 7 (ワールド座標)
+;   順番どおり(= 最小未取得 next_coin)を取れば コンボ継続 (32→48→…)
+;   順番外を取ると コンボリセット(combo_rem=MAX)→ そのボーナスは 32 に戻る
+;   最後に next_coin(最小未取得 = 点滅対象)を再計算
 ; -------------------------------------------------------------
 .proc update_coins
-    ldx next_coin
-    cpx #NUM_COINS
-    bcs @done           ; 全部取り終えた
+    ldx #0
+@loop:
     lda coin_active, x
-    beq @done           ; 念のため (取得済なら何もしない)
+    beq @cont           ; 取得済はスキップ
+    jsr coin_overlaps   ; X=コイン番号 → C=1 で重なり
+    bcc @cont
 
-    ; --- X 重なり: dx = px - cx (16bit)、dx+7 が [0,14] なら重なり ---
+    ; --- 取得! ---
+    lda #0
+    sta coin_active, x
+    cpx next_coin
+    beq @score          ; 順番どおり → コンボ継続
+    lda #COIN_MAX       ; 順番外 → コンボリセット (次の加点は 32)
+    sta combo_rem
+@score:
+    ; 方法A: combo_rem -= combo_rem>>1 ; bonus = MAX - combo_rem
+    lda combo_rem
+    lsr a
+    sta tmp_lo
+    lda combo_rem
+    sec
+    sbc tmp_lo
+    sta combo_rem
+    lda #COIN_MAX
+    sec
+    sbc combo_rem
+    clc
+    adc score_lo
+    sta score_lo
+    lda score_hi
+    adc #0
+    sta score_hi
+@cont:
+    inx
+    cpx #NUM_COINS
+    bne @loop
+
+    ; --- next_coin = 最小の未取得インデックス (点滅 & 順番判定用) ---
+    ldx #0
+@find:
+    lda coin_active, x
+    bne @found          ; 未取得を発見
+    inx
+    cpx #NUM_COINS
+    bne @find
+    ; 全部取った → next_coin = NUM_COINS (該当なし)
+@found:
+    stx next_coin
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; X=コイン番号 のコインがプレイヤーと 8x8 で重なるか
+;   返り値: C=1 重なり / C=0 重ならない。差+7 が [0,14] かで判定
+;   破壊: A, tmp_lo, tmp_hi (X/Y は保持)
+; -------------------------------------------------------------
+.proc coin_overlaps
+    ; X 重なり: dx = px - cx (16bit)
     sec
     lda px_lo
     sbc coin_x_lo, x
@@ -548,44 +599,22 @@ forever:
     sta tmp_lo
     lda tmp_hi
     adc #0
-    bne @done           ; 上位が 0 でない → 範囲外
+    bne @no             ; 上位が 0 でない → 範囲外
     lda tmp_lo
     cmp #15
-    bcs @done           ; >=15 → 重ならない
-
-    ; --- Y 重なり: dy = player_y - cy (8bit)、dy+7 が [0,14] なら重なり ---
+    bcs @no
+    ; Y 重なり: dy = player_y - cy (8bit)
     lda player_y
     sec
     sbc coin_y, x
     clc
     adc #7
     cmp #15
-    bcs @done
-
-    ; --- 取得! コンボ加点 (方法A) ---
-    lda #0
-    sta coin_active, x
-    ; combo_rem -= combo_rem >> 1
-    lda combo_rem
-    lsr a
-    sta tmp_lo
-    lda combo_rem
-    sec
-    sbc tmp_lo
-    sta combo_rem
-    ; bonus = COIN_MAX - combo_rem
-    lda #COIN_MAX
-    sec
-    sbc combo_rem
-    ; score (16bit) += bonus
+    bcs @no
+    sec                 ; 重なり
+    rts
+@no:
     clc
-    adc score_lo
-    sta score_lo
-    lda score_hi
-    adc #0
-    sta score_hi
-    inc next_coin
-@done:
     rts
 .endproc
 
