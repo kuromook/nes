@@ -109,6 +109,15 @@ ITEM_X     = 256         ; アイテムのワールドX (右画面の左寄り /
 ITEM_Y     = 168         ; アイテムのY (1段ジャンプで届く高さ)
 ITEM_COINS = 4           ; 出現に必要なコイン取得数 (コンボ問わず合計)
 
+; ---- ステージ進行 (面 = stage+1) ----
+;   面ごとに機能を積み増す: 面1=足場+コイン / 面2=+トゲ / 面3=+敵
+;   面4=+アイテム(2段ジャンプ) / 面5=+アイテム(リバース)
+;   背景(足場)は全面共通。5面クリアで1面へ周回し enemy_speed +1 で難化 (無限)
+NUM_STAGES  = 5          ; 面数 (1周)
+STAGE_SLOT  = 108        ; 面番号HUD の OAM オフセット (スロット27)
+STAGE_NUM_X = 232        ; 面番号の画面内X (右上)
+STAGE_NUM_Y = 16         ; 面番号の画面内Y
+
 ; ---- 背景タイル / ステージ ----
 TILE_SKY    = 0    ; 空 (空白タイル)
 TILE_GROUND = 2    ; 地面 (レンガタイル)
@@ -165,6 +174,8 @@ item_taken: .res 1   ; アイテム取得フラグ (1=取得済)
 item_kind:  .res 1   ; 出現中アイテムの種別 (0=2段ジャンプ / 1=リバース)
 reversed:   .res 1   ; リバース効果 (1=取得順逆転 & コンボ得点2倍)
 rng:        .res 1   ; 疑似乱数 (8bit LFSR / 毎フレーム更新 / アイテム抽選用)
+stage:      .res 1   ; 現在の面 (0..NUM_STAGES-1 / 表示は +1)
+enemy_speed:.res 1   ; 敵の移動速度 (px/frame / 周回ごとに +1 で難化)
 
 ; -------------------------------------------------------------
 ; iNES ヘッダ
@@ -238,7 +249,13 @@ load_palette:
     lda #$a5              ; 乱数LFSRの初期seed (非ゼロ必須 / 死亡しても維持)
     sta rng
 
-    jsr init_game_state   ; プレイヤー位置・スコア・コンボ・コインを初期化
+    lda #0               ; 起動時: 1面 (stage=0)・スコア0 から
+    sta stage
+    sta score_lo
+    sta score_hi
+    lda #ENEMY_SPEED     ; 敵速度を初期値に (周回で +1)
+    sta enemy_speed
+    jsr reset_stage      ; プレイヤー位置・コンボ・コインを初期化
 
     lda #$00           ; スクロール初期化
     sta PPUADDR
@@ -258,7 +275,7 @@ forever:
 ;   プレイヤーを初期位置(空中)へ / スコア・コンボ・コインを初期状態へ
 ;   ※背景/パレットは不変なので触らない (描画ON中に呼んでも安全)
 ; -------------------------------------------------------------
-.proc init_game_state
+.proc reset_stage
     lda #120           ; キャラ初期位置 (ワールドX=120・空中→落下)
     sta px_lo
     lda #0
@@ -271,8 +288,6 @@ forever:
     sta vy_hi
     sta on_ground
     sta pad1_prev
-    sta score_lo       ; 得点 0
-    sta score_hi
     sta next_coin      ; 最初に取るコイン = 0番
     sta cleared        ; クリア状態を解除
     sta has_dj         ; パワーアップ解除 (2段ジャンプ不可)
@@ -280,9 +295,19 @@ forever:
     sta coins_taken    ; コイン取得数リセット
     sta item_taken     ; アイテム未取得に
     sta reversed       ; リバース効果オフ (取得順は通常 0→7)
-    sta item_kind      ; 種別は仮で0 (4枚目取得時に rng で抽選し上書き)
     lda #COIN_MAX      ; コンボ残量を初期化
     sta combo_rem
+
+    ; アイテム種別を面で固定: 面4(stage3)=2段ジャンプ / 面5(stage4)=リバース
+    ;   (面1-3 はアイテム自体が出ないので未使用)
+    ldx #KIND_DJ
+    lda stage
+    cmp #4
+    bcc @kind_set      ; stage<4 → KIND_DJ
+    ldx #KIND_REVERSE  ; stage>=4 (面5) → KIND_REVERSE
+@kind_set:
+    stx item_kind
+
     ldx #NUM_COINS-1   ; 全コインを「未取得(表示)」に
     lda #1
 @init_coins:
@@ -300,6 +325,34 @@ forever:
     sta enemy_dir, x
     dex
     bpl @init_enemies
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; 次の面へ (クリア画面で Start)。5面クリアで1面へ周回し敵速度+1で難化
+;   スコアは面をまたいで保持 (加算)
+; -------------------------------------------------------------
+.proc next_stage
+    inc stage
+    lda stage
+    cmp #NUM_STAGES
+    bcc @go            ; まだ最終面前 → その面へ
+    lda #0             ; 5面クリア → 1面に戻る (周回)
+    sta stage
+    inc enemy_speed    ; 周回ごとに敵を速く (難化 / 無限)
+@go:
+    jsr reset_stage
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; 死亡: 現在の面を最初からやり直し。スコアは 0 に戻す (面は保持)
+; -------------------------------------------------------------
+.proc die
+    lda #0
+    sta score_lo
+    sta score_hi
+    jsr reset_stage
     rts
 .endproc
 
@@ -332,10 +385,10 @@ forever:
     jmp @render
 
 @frozen:
-    lda pad1           ; クリア画面: Start で最初から
+    lda pad1           ; クリア画面: Start で次の面へ
     and #BTN_START
     beq @render
-    jsr init_game_state
+    jsr next_stage
 
 @render:
     jsr update_camera  ; camera_lo/hi と screen_x を計算
@@ -352,6 +405,7 @@ forever:
     jsr draw_goal      ; ゴール(スロット20) を描画 (全コイン取得後のみ)
     jsr draw_item      ; アイテム(スロット26) を描画 (コイン4枚〜取得まで)
     jsr draw_clear     ; "CLEAR"(スロット21-25) を描画 (cleared 時のみ)
+    jsr draw_stage_num ; 面番号(スロット27) を右上に描画
 
     ; OAM DMA: $0200-$02FF を PPU の OAM へ一括転送
     lda #$00
@@ -661,13 +715,6 @@ forever:
     lda #0
     sta coin_active, x
     inc coins_taken     ; 取得総数 +1 (アイテム出現判定用 / コンボ無関係)
-    lda coins_taken     ; 4枚目ちょうどなら出現アイテムを抽選
-    cmp #ITEM_COINS
-    bne @no_lottery
-    lda rng             ; bit0 で 2段ジャンプ(0) / リバース(1) を決定
-    and #1
-    sta item_kind
-@no_lottery:
     cpx next_coin
     beq @score          ; 順番どおり → コンボ継続
     lda #COIN_MAX       ; 順番外 → コンボリセット (次の加点は 32)
@@ -769,6 +816,10 @@ forever:
 ;   重なり条件はコインと同じ (|px-sx|<=7 かつ |player_y-sy|<=7)
 ; -------------------------------------------------------------
 .proc check_spikes
+    lda stage          ; 面1(stage0)はトゲ無し → 当たり判定なし
+    bne @on
+    rts
+@on:
     ldx #0
 @loop:
     ; X 重なり: dx = px - sx (16bit)、dx+7 が [0,14] か
@@ -797,8 +848,8 @@ forever:
     adc #7
     cmp #15
     bcs @next
-    ; 衝突! 死亡 → 最初から完全リスタート
-    jsr init_game_state
+    ; 衝突! 死亡 → 現在の面を最初からやり直し
+    jsr die
     rts
 @next:
     inx
@@ -811,6 +862,21 @@ forever:
 ; トゲ描画 (スロット13-16): 画面内X = sx - camera。画面外は Y=$FF で隠す
 ; -------------------------------------------------------------
 .proc draw_spikes
+    lda stage          ; 面1(stage0)はトゲ無し → 全スロット非表示
+    bne @on
+    ldy #SPIKE_SLOT0
+    ldx #NUM_SPIKES
+@hclr:
+    lda #$ff
+    sta OAM, y
+    iny
+    iny
+    iny
+    iny
+    dex
+    bne @hclr
+    rts
+@on:
     ldx #0
     ldy #SPIKE_SLOT0
 @loop:
@@ -849,6 +915,11 @@ forever:
 ;   画面内 patrol 前提なので x_lo の 8bit 演算で済む (x_hi は不変)
 ; -------------------------------------------------------------
 .proc update_enemies
+    lda stage          ; 敵は面3(stage2)以降のみ動く
+    cmp #2
+    bcs @on
+    rts
+@on:
     ldx #0
 @loop:
     lda enemy_dir, x
@@ -856,7 +927,7 @@ forever:
     ; --- 右へ ---
     clc
     lda enemy_x_lo, x
-    adc #ENEMY_SPEED
+    adc enemy_speed
     sta enemy_x_lo, x
     cmp enemy_max_lo, x
     bcc @next          ; < max → まだ進める
@@ -869,7 +940,7 @@ forever:
     ; --- 左へ ---
     sec
     lda enemy_x_lo, x
-    sbc #ENEMY_SPEED
+    sbc enemy_speed
     sta enemy_x_lo, x
     cmp enemy_min_lo, x
     bcs @next          ; >= min → まだ進める
@@ -888,6 +959,11 @@ forever:
 ; 敵当たり判定: プレイヤーがどれかの敵に重なったら即死→完全リスタート
 ; -------------------------------------------------------------
 .proc check_enemies
+    lda stage          ; 敵は面3(stage2)以降のみ当たり判定
+    cmp #2
+    bcs @on
+    rts
+@on:
     ldx #0
 @loop:
     sec
@@ -914,7 +990,7 @@ forever:
     adc #7
     cmp #15
     bcs @next
-    jsr init_game_state ; 衝突! 完全リスタート
+    jsr die             ; 衝突! 現在の面を最初からやり直し
     rts
 @next:
     inx
@@ -927,6 +1003,22 @@ forever:
 ; 敵描画 (スロット17-19): 画面内X = ex - camera。進行方向で左右反転
 ; -------------------------------------------------------------
 .proc draw_enemies
+    lda stage          ; 敵は面3(stage2)以降 → それ未満は全スロット非表示
+    cmp #2
+    bcs @on
+    ldy #ENEMY_SLOT0
+    ldx #NUM_ENEMIES
+@hclr:
+    lda #$ff
+    sta OAM, y
+    iny
+    iny
+    iny
+    iny
+    dex
+    bne @hclr
+    rts
+@on:
     ldx #0
     ldy #ENEMY_SLOT0
 @loop:
@@ -1042,6 +1134,9 @@ forever:
 ;   重なり条件はコイン等と同じ (|px-ITEM_X|<=7 かつ |player_y-ITEM_Y|<=7)
 ; -------------------------------------------------------------
 .proc update_item
+    lda stage           ; アイテムは面4(stage3)以降のみ
+    cmp #3
+    bcc @done
     lda item_taken
     bne @done           ; もう取得済
     lda coins_taken
@@ -1095,6 +1190,9 @@ forever:
 ; アイテム描画 (スロット26): 出現中(4枚取得・未取得)かつ画面内のみ表示
 ; -------------------------------------------------------------
 .proc draw_item
+    lda stage           ; アイテムは面4(stage3)以降のみ表示
+    cmp #3
+    bcc @hide
     lda item_taken
     bne @hide
     lda coins_taken
@@ -1173,6 +1271,23 @@ forever:
     inx
     cpx #5
     bne @hloop
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; 面番号HUD (スロット27): 右上に現在の面 (stage+1 = '1'..'5') を表示
+; -------------------------------------------------------------
+.proc draw_stage_num
+    lda #STAGE_NUM_Y
+    sta OAM+STAGE_SLOT
+    lda stage           ; タイル = '0'(DIGIT_BASE) + (stage+1)
+    clc
+    adc #DIGIT_BASE+1
+    sta OAM+STAGE_SLOT+1
+    lda #SCORE_PAL      ; 白 (スプライトパレット2 / HUD と共通)
+    sta OAM+STAGE_SLOT+2
+    lda #STAGE_NUM_X
+    sta OAM+STAGE_SLOT+3
     rts
 .endproc
 
