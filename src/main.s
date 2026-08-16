@@ -118,6 +118,21 @@ STAGE_SLOT  = 108        ; 面番号HUD の OAM オフセット (スロット27)
 STAGE_NUM_X = 232        ; 面番号の画面内X (右上)
 STAGE_NUM_Y = 16         ; 面番号の画面内Y
 
+; ---- 残機 / ゲームオーバー ----
+;   初期 START_LIVES 機。ミスごとに -1 し、0 でゲームオーバー
+;   (ゲームオーバー画面で Start → ニューゲーム)。スコアは残機をまたいで保持
+START_LIVES = 5          ; 初期残機
+LIVES_ICON_SLOT = 112    ; 残機アイコン(プレイヤー顔)の OAM オフセット (スロット28)
+LIVES_DGT_SLOT  = 116    ; 残機数の数字の OAM オフセット (スロット29)
+LIVES_HUD_X = 112        ; 残機HUD の画面内X (上部中央)
+LIVES_HUD_Y = 16         ; 残機HUD の画面内Y
+; "GAME OVER" 表示: 2段 (GAME / OVER)。文字タイル G/M/O/V = 25..28
+TILE_G = 25
+TILE_M = 26
+TILE_O = 27
+TILE_V = 28
+GAMEOVER_SLOT0 = 120     ; "GAME OVER" の OAM 開始オフセット (スロット30 / 8文字)
+
 ; ---- 背景タイル / ステージ ----
 TILE_SKY    = 0    ; 空 (空白タイル)
 TILE_GROUND = 2    ; 地面 (レンガタイル)
@@ -176,6 +191,8 @@ reversed:   .res 1   ; リバース効果 (1=取得順逆転 & コンボ得点2�
 rng:        .res 1   ; 疑似乱数 (8bit LFSR / 毎フレーム更新 / アイテム抽選用)
 stage:      .res 1   ; 現在の面 (0..NUM_STAGES-1 / 表示は +1)
 enemy_speed:.res 1   ; 敵の移動速度 (px/frame / 周回ごとに +1 で難化)
+lives:      .res 1   ; 残機 (START_LIVES から / 0 でゲームオーバー)
+gameover:   .res 1   ; ゲームオーバー状態 (1=表示中 / Startでニューゲーム)
 
 ; -------------------------------------------------------------
 ; iNES ヘッダ
@@ -249,13 +266,7 @@ load_palette:
     lda #$a5              ; 乱数LFSRの初期seed (非ゼロ必須 / 死亡しても維持)
     sta rng
 
-    lda #0               ; 起動時: 1面 (stage=0)・スコア0 から
-    sta stage
-    sta score_lo
-    sta score_hi
-    lda #ENEMY_SPEED     ; 敵速度を初期値に (周回で +1)
-    sta enemy_speed
-    jsr reset_stage      ; プレイヤー位置・コンボ・コインを初期化
+    jsr new_game         ; 残機・スコア・面を初期化してプレイ開始
 
     lda #$00           ; スクロール初期化
     sta PPUADDR
@@ -346,12 +357,34 @@ forever:
 .endproc
 
 ; -------------------------------------------------------------
-; 死亡: 現在の面を最初からやり直し。スコアは 0 に戻す (面は保持)
+; ミス: 残機を1減らす。残機が残っていれば現在の面をやり直し
+;   (スコア・面は保持)、0 になったらゲームオーバー状態へ
 ; -------------------------------------------------------------
 .proc die
+    dec lives
+    beq @over          ; 残機0 → ゲームオーバー
+    jsr reset_stage    ; 残機あり → 現在の面を最初から
+    rts
+@over:
+    lda #1
+    sta gameover
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; ニューゲーム: 1面・残機満タン・スコア0・難易度リセットで開始
+;   起動時とゲームオーバー後の Start で呼ぶ
+; -------------------------------------------------------------
+.proc new_game
     lda #0
+    sta stage
     sta score_lo
     sta score_hi
+    sta gameover
+    lda #ENEMY_SPEED
+    sta enemy_speed
+    lda #START_LIVES
+    sta lives
     jsr reset_stage
     rts
 .endproc
@@ -371,6 +404,8 @@ forever:
 
     jsr read_controller
 
+    lda gameover
+    bne @over          ; ゲームオーバー中は Start でニューゲームのみ
     lda cleared
     bne @frozen        ; クリア後はゲーム更新を止める (Startで再開)
 
@@ -379,8 +414,8 @@ forever:
     jsr update_coins   ; コイン取得判定 → 得点加算 (ワールド座標, カメラ不要)
     jsr update_item    ; アイテム取得判定 (コイン4枚で出現 → 2段ジャンプ)
     jsr update_enemies ; 敵を左右に動かす
-    jsr check_spikes   ; トゲ当たり判定 → 触れたら最初からリスタート
-    jsr check_enemies  ; 敵当たり判定 → 触れたら最初からリスタート
+    jsr check_spikes   ; トゲ当たり判定 → 触れたらミス
+    jsr check_enemies  ; 敵当たり判定 → 触れたらミス
     jsr check_goal     ; 全コイン取得後、ゴール接触で cleared=1
     jmp @render
 
@@ -389,6 +424,13 @@ forever:
     and #BTN_START
     beq @render
     jsr next_stage
+    jmp @render
+
+@over:
+    lda pad1           ; ゲームオーバー: Start で最初から (ニューゲーム)
+    and #BTN_START
+    beq @render
+    jsr new_game
 
 @render:
     jsr update_camera  ; camera_lo/hi と screen_x を計算
@@ -406,6 +448,8 @@ forever:
     jsr draw_item      ; アイテム(スロット26) を描画 (コイン4枚〜取得まで)
     jsr draw_clear     ; "CLEAR"(スロット21-25) を描画 (cleared 時のみ)
     jsr draw_stage_num ; 面番号(スロット27) を右上に描画
+    jsr draw_lives     ; 残機HUD(スロット28-29) を上部に描画
+    jsr draw_gameover  ; "GAME OVER"(スロット30-37) を描画 (gameover 時のみ)
 
     ; OAM DMA: $0200-$02FF を PPU の OAM へ一括転送
     lda #$00
@@ -1292,6 +1336,74 @@ forever:
 .endproc
 
 ; -------------------------------------------------------------
+; 残機HUD (スロット28-29): プレイヤー顔アイコン + 残機数の数字
+; -------------------------------------------------------------
+.proc draw_lives
+    lda #LIVES_HUD_Y       ; アイコン (プレイヤーの顔)
+    sta OAM+LIVES_ICON_SLOT
+    lda #TILE_WALK_A
+    sta OAM+LIVES_ICON_SLOT+1
+    lda #0                 ; スプライトパレット0 (キャラ赤)
+    sta OAM+LIVES_ICON_SLOT+2
+    lda #LIVES_HUD_X
+    sta OAM+LIVES_ICON_SLOT+3
+    lda #LIVES_HUD_Y       ; 残機数の数字
+    sta OAM+LIVES_DGT_SLOT
+    lda lives              ; タイル = '0'(DIGIT_BASE) + lives
+    clc
+    adc #DIGIT_BASE
+    sta OAM+LIVES_DGT_SLOT+1
+    lda #SCORE_PAL         ; 白 (スプライトパレット2 / HUD と共通)
+    sta OAM+LIVES_DGT_SLOT+2
+    lda #LIVES_HUD_X+12
+    sta OAM+LIVES_DGT_SLOT+3
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; "GAME OVER" 描画 (スロット30-37): gameover 時のみ 2段で中央表示
+;   前半4文字=GAME(上段) / 後半4文字=OVER(下段)。座標は go_x/go_y
+; -------------------------------------------------------------
+.proc draw_gameover
+    lda gameover
+    beq @hide
+    ldx #0
+@loop:
+    txa                    ; OAM オフセット = GAMEOVER_SLOT0 + 文字*4
+    asl a
+    asl a
+    clc
+    adc #GAMEOVER_SLOT0
+    tay
+    lda go_y, x
+    sta OAM, y
+    lda go_tiles, x
+    sta OAM+1, y
+    lda #CLEAR_PAL         ; 白 (スプライトパレット2)
+    sta OAM+2, y
+    lda go_x, x
+    sta OAM+3, y
+    inx
+    cpx #8
+    bne @loop
+    rts
+@hide:
+    ldx #0
+    ldy #GAMEOVER_SLOT0
+@hloop:
+    lda #$ff
+    sta OAM, y
+    iny
+    iny
+    iny
+    iny
+    inx
+    cpx #8
+    bne @hloop
+    rts
+.endproc
+
+; -------------------------------------------------------------
 ; コイン描画 (スロット1-8) ＋ 得点HUD (スロット9)
 ;   各コイン: 画面内X = cx - camera。0..255 に収まる時だけ表示
 ;   未取得かつ画面内のみ表示、それ以外は Y=$FF で隠す
@@ -1624,6 +1736,11 @@ enemy_y:      .byte 208, 208, 208
 ; "CLEAR" の文字タイル並び
 clear_tiles:  .byte TILE_C, TILE_L, TILE_E, TILE_A, TILE_R
 
+; "GAME OVER" の文字/座標 (前半4=GAME上段 / 後半4=OVER下段)
+go_tiles:  .byte TILE_G, TILE_A, TILE_M, TILE_E,  TILE_O, TILE_V, TILE_E, TILE_R
+go_x:      .byte 112, 120, 128, 136,  112, 120, 128, 136
+go_y:      .byte  72,  72,  72,  72,   88,  88,  88,  88
+
 ; -------------------------------------------------------------
 ; 割り込みベクタ
 ; -------------------------------------------------------------
@@ -1702,5 +1819,14 @@ clear_tiles:  .byte TILE_C, TILE_L, TILE_E, TILE_A, TILE_R
     ; タイル24: リバース (左右の双方向矢印 / 両plane=1 → index3 紫)
     .byte $00,$24,$66,$ff,$66,$24,$00,$00   ; plane 0
     .byte $00,$24,$66,$ff,$66,$24,$00,$00   ; plane 1
-    ; 残りを 0 で埋めて 8KB に (タイル0..24 = 400byte)
-    .res 8192 - 400, $00
+    ; タイル25..28: 文字 'G' 'M' 'O' 'V' (GAME OVER 用 / plane0 のみ = index1)
+    .byte $7c,$c6,$c0,$ce,$c6,$c6,$7e,$00   ; 'G'
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $c6,$ee,$fe,$d6,$c6,$c6,$c6,$00   ; 'M'
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $7c,$c6,$c6,$c6,$c6,$c6,$7c,$00   ; 'O'
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    .byte $c6,$c6,$c6,$c6,$6c,$38,$10,$00   ; 'V'
+    .byte $00,$00,$00,$00,$00,$00,$00,$00
+    ; 残りを 0 で埋めて 8KB に (タイル0..28 = 464byte)
+    .res 8192 - 464, $00
