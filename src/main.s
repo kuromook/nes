@@ -193,6 +193,8 @@ stage:      .res 1   ; 現在の面 (0..NUM_STAGES-1 / 表示は +1)
 enemy_speed:.res 1   ; 敵の移動速度 (px/frame / 周回ごとに +1 で難化)
 lives:      .res 1   ; 残機 (START_LIVES から / 0 でゲームオーバー)
 gameover:   .res 1   ; ゲームオーバー状態 (1=表示中 / Startでニューゲーム)
+lap:        .res 1   ; 周回数 (0=1周目 / 2周目以降で配色が変わる)
+pal_dirty:  .res 1   ; 1=このフレームで配色を書き直す (変化時のみ / 毎フレームは重い)
 
 ; -------------------------------------------------------------
 ; iNES ヘッダ
@@ -351,6 +353,9 @@ forever:
     lda #0             ; 5面クリア → 1面に戻る (周回)
     sta stage
     inc enemy_speed    ; 周回ごとに敵を速く (難化 / 無限)
+    inc lap            ; 周回数 +1 (2周目以降は配色が変わる)
+    lda #1             ; 周回が変わったので配色を更新
+    sta pal_dirty
 @go:
     jsr reset_stage
     rts
@@ -381,6 +386,9 @@ forever:
     sta score_lo
     sta score_hi
     sta gameover
+    sta lap
+    lda #1             ; 起動/リスタート時に配色を1回反映
+    sta pal_dirty
     lda #ENEMY_SPEED
     sta enemy_speed
     lda #START_LIVES
@@ -398,6 +406,15 @@ forever:
     pha
     tya
     pha
+
+    ; 配色更新は vblank 冒頭で (変化フレームのみ)。ここなら vblank 内に収まり
+    ; PPUADDR 書き込みが描画を乱さない。通常フレームは pal_dirty=0 でスキップ
+    lda pal_dirty
+    beq @skip_pal
+    jsr update_palette
+    lda #0
+    sta pal_dirty
+@skip_pal:
 
     inc frame_cnt      ; 点滅などの周期カウンタ
     jsr update_rng     ; 乱数LFSRを1ステップ進める (アイテム抽選用)
@@ -1404,6 +1421,45 @@ forever:
 .endproc
 
 ; -------------------------------------------------------------
+; 周回配色の更新: lap に応じて空・足場・敵の色を PPU パレットへ書く
+;   NMI(vblank)内で毎フレーム呼ぶ。数バイトなので vblank 予算内
+;   1周目(lap0)=デフォルト色 / 2周目以降で変化 (NUM_SCHEMES で頭打ち)
+; -------------------------------------------------------------
+.proc update_palette
+    ldx lap
+    cpx #NUM_SCHEMES
+    bcc @ok
+    ldx #NUM_SCHEMES-1   ; 上限を超えたら最後の配色で固定
+@ok:
+    bit PPUSTATUS        ; アドレスラッチをリセット
+    lda #$3f
+    sta PPUADDR
+    lda #$00
+    sta PPUADDR          ; → PPU $3F00
+    lda lap_sky, x
+    sta PPUDATA          ; $3F00 空(backdrop)
+    lda lap_brick, x
+    sta PPUDATA          ; $3F01 レンガ本体
+    lda lap_light, x
+    sta PPUDATA          ; $3F02 レンガ明色
+    lda lap_mortar, x
+    sta PPUDATA          ; $3F03 目地
+    bit PPUSTATUS
+    lda #$3f
+    sta PPUADDR
+    lda #$1e
+    sta PPUADDR          ; → PPU $3F1E (スプライトパレット3 index2 = 敵の体)
+    lda lap_enemy, x
+    sta PPUDATA
+    ; アドレスをパレット外へ戻す (backdrop 化け防止)
+    bit PPUSTATUS
+    lda #$00
+    sta PPUADDR
+    sta PPUADDR
+    rts
+.endproc
+
+; -------------------------------------------------------------
 ; コイン描画 (スロット1-8) ＋ 得点HUD (スロット9)
 ;   各コイン: 画面内X = cx - camera。0..255 に収まる時だけ表示
 ;   未取得かつ画面内のみ表示、それ以外は Y=$FF で隠す
@@ -1688,6 +1744,18 @@ palette:
     ; パレット2: index1=白(HUD/CLEAR) / index2=緑(2段ジャンプ) / index3=紫(リバース)
     .byte $0f,$16,$27,$30,  $0f,$28,$27,$30
     .byte $0f,$30,$2a,$24,  $0f,$10,$2a,$30
+
+; -------------------------------------------------------------
+; 周回ごとの配色 (lap で選択 / 1周目=lap0 はデフォルト色)
+;   sky=$3F00(空) / brick=$3F01 / light=$3F02 / mortar=$3F03(目地)
+;   enemy=$3F1E(スプライトパレット3 index2 = 敵の体)
+; -------------------------------------------------------------
+NUM_SCHEMES = 4
+lap_sky:    .byte $22, $27, $0f, $1a   ; 青空 / 夕暮れ / 夜 / 毒
+lap_brick:  .byte $07, $17, $00, $08
+lap_light:  .byte $17, $27, $10, $18
+lap_mortar: .byte $30, $30, $30, $30
+lap_enemy:  .byte $2a, $28, $21, $14   ; 緑 / 黄 / 水色 / 紫
 
 ; -------------------------------------------------------------
 ; 足場テーブル (ワールド・ピクセル座標 / 描画と当たり判定で共用)
