@@ -195,6 +195,7 @@ lives:      .res 1   ; 残機 (START_LIVES から / 0 でゲームオーバー)
 gameover:   .res 1   ; ゲームオーバー状態 (1=表示中 / Startでニューゲーム)
 lap:        .res 1   ; 周回数 (0=1周目 / 2周目以降で配色が変わる)
 pal_dirty:  .res 1   ; 1=このフレームで配色を書き直す (変化時のみ / 毎フレームは重い)
+paused:     .res 1   ; ポーズ状態 (1=ポーズ中/面セレクト中 / Startで解除・その面から再開)
 
 ; -------------------------------------------------------------
 ; iNES ヘッダ
@@ -303,6 +304,7 @@ forever:
     sta pad1_prev
     sta next_coin      ; 最初に取るコイン = 0番
     sta cleared        ; クリア状態を解除
+    sta paused         ; ポーズ解除 (面セレクトから再開する時もここで戻る)
     sta has_dj         ; パワーアップ解除 (2段ジャンプ不可)
     sta jumps_left     ; ジャンプ残量リセット (空中スタートなので 0)
     sta coins_taken    ; コイン取得数リセット
@@ -398,6 +400,51 @@ forever:
 .endproc
 
 ; -------------------------------------------------------------
+; 面セレクト (ポーズ中の面カウンタ操作 / デバッグ・テストプレイ用)
+;   上=面を1つ進める / 下=1つ戻す (0..NUM_STAGES-1 で巡回)。
+;   Start でポーズ解除 → 選んだ面を最初から開始 (reset_stage で paused=0)。
+;   スコア・残機・周回(lap)は保持したまま、その面だけをやり直す。
+; -------------------------------------------------------------
+.proc stage_select
+    lda pad1_prev      ; このフレーム新たに押されたボタン
+    eor #$ff
+    and pad1
+    sta tmp_lo
+
+    lda tmp_lo         ; --- 上: stage++ (NUM_STAGES で 0 に巡回) ---
+    and #BTN_UP
+    beq @no_up
+    lda stage
+    clc
+    adc #1
+    cmp #NUM_STAGES
+    bcc @up_set
+    lda #0
+@up_set:
+    sta stage
+@no_up:
+
+    lda tmp_lo         ; --- 下: stage-- (0 から NUM_STAGES-1 へ巡回) ---
+    and #BTN_DOWN
+    beq @no_down
+    lda stage
+    bne @dec
+    lda #NUM_STAGES    ; 0 → 巡回して最終面へ
+@dec:
+    sec
+    sbc #1
+    sta stage
+@no_down:
+
+    lda tmp_lo         ; --- Start: 解除して選んだ面から開始 ---
+    and #BTN_START
+    beq @done
+    jsr reset_stage    ; paused=0・item_kind 等を stage に合わせて再初期化
+@done:
+    rts
+.endproc
+
+; -------------------------------------------------------------
 ; NMI: 入力読取 → 移動 → OAM更新 → DMA転送 → スクロール戻し
 ; -------------------------------------------------------------
 .proc nmi
@@ -426,6 +473,20 @@ forever:
     lda cleared
     bne @frozen        ; クリア後はゲーム更新を止める (Startで再開)
 
+    lda paused
+    bne @paused        ; ポーズ中は面セレクトのみ (Startで解除)
+
+    ; Start 押下エッジでポーズに入る (面セレクト開始)
+    lda pad1_prev
+    eor #$ff
+    and pad1
+    and #BTN_START
+    beq @play
+    lda #1
+    sta paused
+    jmp @render
+
+@play:
     ; --- プレイ中: ゲーム更新 ---
     jsr move_player
     jsr update_coins   ; コイン取得判定 → 得点加算 (ワールド座標, カメラ不要)
@@ -434,6 +495,10 @@ forever:
     jsr check_spikes   ; トゲ当たり判定 → 触れたらミス
     jsr check_enemies  ; 敵当たり判定 → 触れたらミス
     jsr check_goal     ; 全コイン取得後、ゴール接触で cleared=1
+    jmp @render
+
+@paused:
+    jsr stage_select   ; 上下で面カウンタ変更 / Start でその面から再開
     jmp @render
 
 @frozen:
@@ -483,6 +548,9 @@ forever:
     sta PPUSCROLL      ; X スクロール
     lda #$00
     sta PPUSCROLL      ; Y スクロール = 0
+
+    lda pad1           ; 次フレームのエッジ検出用に保存 (ポーズ中も更新される
+    sta pad1_prev      ; よう move_player から NMI 末尾へ移動)
 
     pla
     tay
@@ -648,7 +716,7 @@ forever:
     clc
     adc #1
     sta jumps_left
-    jmp @save_pad
+    jmp @done
 @pnext:
     dey
     bpl @ploop
@@ -670,14 +738,12 @@ forever:
     clc
     adc #1
     sta jumps_left
-    jmp @save_pad
+    jmp @done
 @airborne:
     lda #0
     sta on_ground
 
-@save_pad:
-    lda pad1           ; 次フレームのエッジ検出用に保存
-    sta pad1_prev
+@done:                 ; pad1_prev の保存は NMI 末尾に一本化 (ポーズ中も更新するため)
     rts
 .endproc
 
@@ -1339,6 +1405,15 @@ forever:
 ; 面番号HUD (スロット27): 右上に現在の面 (stage+1 = '1'..'5') を表示
 ; -------------------------------------------------------------
 .proc draw_stage_num
+    lda paused          ; ポーズ中は面番号を点滅させ「面セレクト中」を示す
+    beq @show
+    lda frame_cnt
+    and #BLINK_MASK
+    beq @show
+    lda #$ff            ; 消灯フェーズ → 隠す
+    sta OAM+STAGE_SLOT
+    rts
+@show:
     lda #STAGE_NUM_Y
     sta OAM+STAGE_SLOT
     lda stage           ; タイル = '0'(DIGIT_BASE) + (stage+1)
